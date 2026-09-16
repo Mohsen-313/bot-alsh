@@ -1,0 +1,83 @@
+import os
+import random
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 توليد إشارة", callback_data="signal")],
+        [InlineKeyboardButton("⚠️ تحذير المخاطر", callback_data="warning")],
+    ]
+
+    await update.message.reply_text(
+        "🦁 أهلاً بك في بوت الأسد\n\n"
+        "اختر من القائمة:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "warning":
+        await query.message.reply_text(
+            "⚠️ تنبيه:\n"
+            "التداول ينطوي على مخاطر مالية عالية.\n"
+            "لا تعتبر الإشارات توصية استثمارية."
+        )
+
+    elif query.data == "signal":
+        pair = random.choice([
+            "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"
+        ])
+
+        direction = random.choice(["🟢 BUY", "🔴 SELL"])
+        duration = random.randint(1, 15)
+
+        await query.message.reply_text(
+            "🦁 إشارة الأسد\n\n"
+            f"💱 السوق: {pair}\n"
+            f"📈 الاتجاه: {direction}\n"
+            f"⏱ المدة: {duration} دقيقة"
+        )
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    print("Bot started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
