@@ -1,12 +1,28 @@
 import os
 import random
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+REAL_PAIRS = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
+    "USDCAD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY",
+    "AUDJPY", "CADJPY", "CHFJPY", "AUDCAD", "AUDCHF",
+    "AUDNZD", "EURAUD", "EURCAD", "EURCHF", "EURNZD",
+    "GBPAUD", "GBPCAD", "GBPCHF", "GBPNZD", "NZDCAD",
+    "NZDCHF", "NZDJPY", "CADCHF"
+]
+
+OTC_PAIRS = [f"{pair} OTC" for pair in REAL_PAIRS]
+
+SIGNAL_COOLDOWN = 120
+last_signal_time = {}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -25,16 +41,84 @@ def start_health_server():
     server.serve_forever()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def main_menu():
     keyboard = [
-        [InlineKeyboardButton("📊 توليد إشارة", callback_data="signal")],
-        [InlineKeyboardButton("⚠️ تحذير المخاطر", callback_data="warning")],
+        [InlineKeyboardButton("📈 الأسواق الحقيقية", callback_data="real")],
+        [InlineKeyboardButton("🟣 أسواق OTC", callback_data="otc")],
+        [InlineKeyboardButton("⚠️ تحذير المخاطر", callback_data="warning")]
     ]
+    return InlineKeyboardMarkup(keyboard)
 
+
+def pair_menu(pairs, prefix):
+    keyboard = []
+
+    for i in range(0, len(pairs), 2):
+        row = [
+            InlineKeyboardButton(
+                pairs[i],
+                callback_data=f"{prefix}:{i}"
+            )
+        ]
+
+        if i + 1 < len(pairs):
+            row.append(
+                InlineKeyboardButton(
+                    pairs[i + 1],
+                    callback_data=f"{prefix}:{i + 1}"
+                )
+            )
+
+        keyboard.append(row)
+
+    keyboard.append([
+        InlineKeyboardButton("🔙 رجوع", callback_data="markets")
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🦁 أهلاً بك في بوت الأسد\n\n"
-        "اختر من القائمة:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "اختر السوق الذي تريد الدخول إليه:",
+        reply_markup=main_menu()
+    )
+
+
+async def send_signal(query, pair):
+    user_id = query.from_user.id
+    now = time.time()
+
+    if user_id in last_signal_time:
+        elapsed = now - last_signal_time[user_id]
+
+        if elapsed < SIGNAL_COOLDOWN:
+            remaining = int(SIGNAL_COOLDOWN - elapsed)
+
+            await query.message.reply_text(
+                f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية."
+            )
+            return
+
+    last_signal_time[user_id] = now
+
+    direction = random.choice(["🟢 BUY", "🔴 SELL"])
+    duration = random.randint(1, 15)
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 إشارة ثانية", callback_data="new_signal")]
+    ]
+
+    await query.message.reply_text(
+        "🦁 إشارة الأسد\n\n"
+        f"💱 السوق: {pair}\n"
+        f"📈 الاتجاه: {direction}\n"
+        f"⏱ المدة: {duration} دقيقة\n\n"
+        "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
+        "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
+        "لا تعتبر الإشارة توصية استثمارية.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
@@ -42,26 +126,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "warning":
+    data = query.data
+
+    if data == "markets" or data == "new_signal":
         await query.message.reply_text(
-            "⚠️ تنبيه:\n"
-            "التداول ينطوي على مخاطر مالية عالية.\n"
-            "لا تعتبر الإشارات توصية استثمارية."
+            "🦁 اختر السوق:",
+            reply_markup=main_menu()
         )
 
-    elif query.data == "signal":
-        pair = random.choice([
-            "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"
-        ])
-
-        direction = random.choice(["🟢 BUY", "🔴 SELL"])
-        duration = random.randint(1, 15)
-
+    elif data == "real":
         await query.message.reply_text(
-            "🦁 إشارة الأسد\n\n"
-            f"💱 السوق: {pair}\n"
-            f"📈 الاتجاه: {direction}\n"
-            f"⏱ المدة: {duration} دقيقة"
+            "📈 اختر زوج العملات:",
+            reply_markup=pair_menu(REAL_PAIRS, "realpair")
+        )
+
+    elif data == "otc":
+        await query.message.reply_text(
+            "🟣 اختر زوج OTC:",
+            reply_markup=pair_menu(OTC_PAIRS, "otcpair")
+        )
+
+    elif data.startswith("realpair:"):
+        index = int(data.split(":")[1])
+        await send_signal(query, REAL_PAIRS[index])
+
+    elif data.startswith("otcpair:"):
+        index = int(data.split(":")[1])
+        await send_signal(query, OTC_PAIRS[index])
+
+    elif data == "warning":
+        await query.message.reply_text(
+            "⚠️ تحذير المخاطر\n\n"
+            "التداول ينطوي على مخاطر مالية عالية.\n"
+            "لا تعتبر الإشارات توصية استثمارية.\n"
+            "استخدم رأس مال تستطيع تحمل خسارته."
         )
 
 
@@ -69,13 +167,18 @@ def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    threading.Thread(target=start_health_server, daemon=True).start()
+    threading.Thread(
+        target=start_health_server,
+        daemon=True
+    ).start()
 
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     print("Bot started")
+
     app.run_polling()
 
 
