@@ -20,12 +20,19 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# رقم حساب Telegram الخاص بك يوضع لاحقاً في Render
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# =========================================================
+# ADMIN
+# =========================================================
+
+ADMIN_ID = 8557636222
 
 # قاعدة البيانات
 DB_FILE = os.getenv("DB_FILE", "bot.db")
 
+
+# =========================================================
+# الأسواق
+# =========================================================
 
 REAL_PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
@@ -73,6 +80,10 @@ def init_db():
     conn.close()
 
 
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
 def is_activated(user_id):
     conn = db_connect()
     cursor = conn.cursor()
@@ -110,7 +121,6 @@ def activate_code(code, user_id):
             conn.close()
             return False
 
-        # الكود مستخدم مسبقاً
         if result[0] is not None:
             conn.rollback()
             conn.close()
@@ -147,20 +157,69 @@ def activate_code(code, user_id):
 
 
 def create_access_code():
-    code = "LION-" + secrets.token_hex(4).upper()
+    while True:
+
+        code = "LION-" + secrets.token_hex(4).upper()
+
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT code FROM access_codes WHERE code = ?",
+            (code,)
+        )
+
+        exists = cursor.fetchone()
+
+        if not exists:
+
+            cursor.execute(
+                "INSERT INTO access_codes (code) VALUES (?)",
+                (code,)
+            )
+
+            conn.commit()
+            conn.close()
+
+            return code
+
+        conn.close()
+
+
+# =========================================================
+# إحصائيات الإدارة
+# =========================================================
+
+def get_statistics():
 
     conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute(
-        "INSERT INTO access_codes (code) VALUES (?)",
-        (code,)
+        "SELECT COUNT(*) FROM users"
     )
+    users_count = cursor.fetchone()[0]
 
-    conn.commit()
+    cursor.execute(
+        "SELECT COUNT(*) FROM access_codes"
+    )
+    total_codes = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM access_codes WHERE used_by IS NOT NULL"
+    )
+    used_codes = cursor.fetchone()[0]
+
+    unused_codes = total_codes - used_codes
+
     conn.close()
 
-    return code
+    return (
+        users_count,
+        total_codes,
+        used_codes,
+        unused_codes
+    )
 
 
 # =========================================================
@@ -179,6 +238,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+
     port = int(os.getenv("PORT", "10000"))
 
     server = HTTPServer(
@@ -190,7 +250,7 @@ def start_health_server():
 
 
 # =========================================================
-# القوائم
+# قوائم العملاء
 # =========================================================
 
 def main_menu():
@@ -254,12 +314,56 @@ def pair_menu(pairs, prefix):
 
 
 # =========================================================
-# بداية البوت
+# لوحة الإدارة
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def admin_menu():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "👥 عدد المشتركين",
+                callback_data="admin_users"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎟 إنشاء كود جديد",
+                callback_data="admin_newcode"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 الإحصائيات",
+                callback_data="admin_stats"
+            )
+        ]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# /start
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
+
+    # الأدمن يدخل مباشرة
+    if is_admin(user_id):
+
+        await update.message.reply_text(
+            "👑 أهلاً بك يا مدير بوت الأسد.\n\n"
+            "اختر من لوحة الإدارة:",
+            reply_markup=admin_menu()
+        )
+
+        return
 
     if is_activated(user_id):
 
@@ -279,7 +383,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# تفعيل الكود
+# /admin
+# =========================================================
+
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+
+        await update.message.reply_text(
+            "⛔ هذا الأمر مخصص للإدارة فقط."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "👑 لوحة إدارة بوت الأسد\n\n"
+        "اختر العملية التي تريد تنفيذها:",
+        reply_markup=admin_menu()
+    )
+
+
+# =========================================================
+# إنشاء كود
+# =========================================================
+
+async def new_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+
+        await update.message.reply_text(
+            "⛔ هذا الأمر مخصص للإدارة فقط."
+        )
+
+        return
+
+    code = create_access_code()
+
+    await update.message.reply_text(
+        "🎟 تم إنشاء كود تفعيل جديد\n\n"
+        f"🔐 الكود:\n{code}\n\n"
+        "♻️ يمكن استخدامه مرة واحدة فقط."
+    )
+
+
+# =========================================================
+# استقبال كود العميل
 # =========================================================
 
 async def activation_handler(
@@ -292,13 +450,16 @@ async def activation_handler(
 
     user_id = update.effective_user.id
 
-    # إذا كان المستخدم مفعلاً بالفعل
+    # الأدمن لا يحتاج كود
+    if is_admin(user_id):
+        return
+
+    # المستخدم مفعل مسبقاً
     if is_activated(user_id):
         return
 
     code = update.message.text.strip().upper()
 
-    # نتأكد أنه يبدو ككود بوت الأسد
     if not code.startswith("LION-"):
 
         await update.message.reply_text(
@@ -327,34 +488,6 @@ async def activation_handler(
 
 
 # =========================================================
-# إنشاء أكواد للعملاء - للإدارة فقط
-# =========================================================
-
-async def new_code(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if user_id != ADMIN_ID:
-
-        await update.message.reply_text(
-            "⛔ هذا الأمر مخصص للإدارة فقط."
-        )
-
-        return
-
-    code = create_access_code()
-
-    await update.message.reply_text(
-        "🎟 تم إنشاء كود تفعيل جديد\n\n"
-        f"🔐 الكود:\n{code}\n\n"
-        "يمكن استخدامه مرة واحدة فقط."
-    )
-
-
-# =========================================================
 # إرسال الإشارة
 # =========================================================
 
@@ -362,8 +495,7 @@ async def send_signal(query, pair):
 
     user_id = query.from_user.id
 
-    # حماية إضافية
-    if not is_activated(user_id):
+    if not is_admin(user_id) and not is_activated(user_id):
 
         await query.message.reply_text(
             "🔐 يجب تفعيل حسابك أولاً."
@@ -420,14 +552,14 @@ async def send_signal(query, pair):
         "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
 
         "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
-        "لا تعتبر الإشارة توصية استثمارية.",
+        "هذه إشارة عشوائية وليست توصية استثمارية.",
 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # =========================================================
-# التعامل مع الأزرار
+# الأزرار
 # =========================================================
 
 async def button_handler(
@@ -440,9 +572,64 @@ async def button_handler(
     await query.answer()
 
     user_id = query.from_user.id
+    data = query.data
 
-    # منع أي شخص غير مفعّل من استخدام الأزرار
-    if not is_activated(user_id):
+    # =====================================================
+    # لوحة الإدارة
+    # =====================================================
+
+    if data.startswith("admin_"):
+
+        if not is_admin(user_id):
+
+            await query.message.reply_text(
+                "⛔ هذا القسم مخصص للإدارة فقط."
+            )
+
+            return
+
+        if data == "admin_users":
+
+            users_count, total, used, unused = get_statistics()
+
+            await query.message.reply_text(
+                "👥 عدد المشتركين\n\n"
+                f"👤 المشتركين المفعّلين: {users_count}"
+            )
+
+            return
+
+        if data == "admin_newcode":
+
+            code = create_access_code()
+
+            await query.message.reply_text(
+                "🎟 تم إنشاء كود جديد\n\n"
+                f"🔐 {code}\n\n"
+                "♻️ صالح للاستخدام مرة واحدة فقط."
+            )
+
+            return
+
+        if data == "admin_stats":
+
+            users_count, total, used, unused = get_statistics()
+
+            await query.message.reply_text(
+                "📊 إحصائيات بوت الأسد\n\n"
+                f"👥 المشتركين: {users_count}\n"
+                f"🎟 إجمالي الأكواد: {total}\n"
+                f"✅ الأكواد المستخدمة: {used}\n"
+                f"🟢 الأكواد المتبقية: {unused}"
+            )
+
+            return
+
+    # =====================================================
+    # منع العميل غير المفعل
+    # =====================================================
+
+    if not is_admin(user_id) and not is_activated(user_id):
 
         await query.message.reply_text(
             "🔐 حسابك غير مفعّل.\n"
@@ -451,7 +638,9 @@ async def button_handler(
 
         return
 
-    data = query.data
+    # =====================================================
+    # قوائم العميل
+    # =====================================================
 
     if data == "markets":
 
@@ -522,7 +711,7 @@ async def button_handler(
             "⚠️ تحذير المخاطر\n\n"
 
             "التداول ينطوي على مخاطر مالية عالية.\n"
-            "لا تعتبر الإشارات توصية استثمارية.\n"
+            "الإشارات الموجودة في هذا البوت عشوائية وليست توصية استثمارية.\n"
             "استخدم رأس مال تستطيع تحمل خسارته."
         )
 
@@ -539,10 +728,8 @@ def main():
             "TELEGRAM_BOT_TOKEN is not set"
         )
 
-    # إنشاء قاعدة البيانات والجداول
     init_db()
 
-    # تشغيل Health Server
     threading.Thread(
         target=start_health_server,
         daemon=True
@@ -555,7 +742,7 @@ def main():
         .build()
     )
 
-    # أمر البداية
+    # /start
     app.add_handler(
         CommandHandler(
             "start",
@@ -563,7 +750,15 @@ def main():
         )
     )
 
-    # أمر إنشاء كود جديد للإدارة
+    # /admin
+    app.add_handler(
+        CommandHandler(
+            "admin",
+            admin_command
+        )
+    )
+
+    # /newcode
     app.add_handler(
         CommandHandler(
             "newcode",
@@ -571,7 +766,7 @@ def main():
         )
     )
 
-    # استقبال كود التفعيل
+    # أكواد العملاء
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -579,7 +774,7 @@ def main():
         )
     )
 
-    # أزرار البوت
+    # الأزرار
     app.add_handler(
         CallbackQueryHandler(
             button_handler
