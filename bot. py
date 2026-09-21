@@ -1,14 +1,31 @@
 import os
 import random
+import secrets
+import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# رقم حساب Telegram الخاص بك يوضع لاحقاً في Render
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# قاعدة البيانات
+DB_FILE = os.getenv("DB_FILE", "bot.db")
+
 
 REAL_PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
@@ -25,7 +42,133 @@ SIGNAL_COOLDOWN = 120
 last_signal_time = {}
 
 
+# =========================================================
+# قاعدة البيانات
+# =========================================================
+
+def db_connect():
+    return sqlite3.connect(DB_FILE)
+
+
+def init_db():
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            activated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS access_codes (
+            code TEXT PRIMARY KEY,
+            used_by INTEGER,
+            used_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def is_activated(user_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+
+    result = cursor.fetchone()
+
+    conn.close()
+
+    return result is not None
+
+
+def activate_code(code, user_id):
+    code = code.strip().upper()
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute(
+            "SELECT used_by FROM access_codes WHERE code = ?",
+            (code,)
+        )
+
+        result = cursor.fetchone()
+
+        if not result:
+            conn.rollback()
+            conn.close()
+            return False
+
+        # الكود مستخدم مسبقاً
+        if result[0] is not None:
+            conn.rollback()
+            conn.close()
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        cursor.execute(
+            """
+            UPDATE access_codes
+            SET used_by = ?, used_at = ?
+            WHERE code = ? AND used_by IS NULL
+            """,
+            (user_id, now, code)
+        )
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, activated_at)
+            VALUES (?, ?)
+            """,
+            (user_id, now)
+        )
+
+        conn.commit()
+        conn.close()
+
+        return True
+
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return False
+
+
+def create_access_code():
+    code = "LION-" + secrets.token_hex(4).upper()
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "INSERT INTO access_codes (code) VALUES (?)",
+        (code,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return code
+
+
+# =========================================================
+# Render Health Server
+# =========================================================
+
 class HealthHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
@@ -37,23 +180,51 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
+# =========================================================
+# القوائم
+# =========================================================
+
 def main_menu():
+
     keyboard = [
-        [InlineKeyboardButton("📈 الأسواق الحقيقية", callback_data="real")],
-        [InlineKeyboardButton("🟣 أسواق OTC", callback_data="otc")],
-        [InlineKeyboardButton("⚠️ تحذير المخاطر", callback_data="warning")]
+        [
+            InlineKeyboardButton(
+                "📈 الأسواق الحقيقية",
+                callback_data="real"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🟣 أسواق OTC",
+                callback_data="otc"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⚠️ تحذير المخاطر",
+                callback_data="warning"
+            )
+        ]
     ]
+
     return InlineKeyboardMarkup(keyboard)
 
 
 def pair_menu(pairs, prefix):
+
     keyboard = []
 
     for i in range(0, len(pairs), 2):
+
         row = [
             InlineKeyboardButton(
                 pairs[i],
@@ -62,6 +233,7 @@ def pair_menu(pairs, prefix):
         ]
 
         if i + 1 < len(pairs):
+
             row.append(
                 InlineKeyboardButton(
                     pairs[i + 1],
@@ -72,110 +244,347 @@ def pair_menu(pairs, prefix):
         keyboard.append(row)
 
     keyboard.append([
-        InlineKeyboardButton("🔙 رجوع", callback_data="markets")
+        InlineKeyboardButton(
+            "🔙 رجوع",
+            callback_data="markets"
+        )
     ])
 
     return InlineKeyboardMarkup(keyboard)
 
 
+# =========================================================
+# بداية البوت
+# =========================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
+
+    if is_activated(user_id):
+
+        await update.message.reply_text(
+            "🦁 أهلاً بك مجدداً في بوت الأسد\n\n"
+            "اختر السوق الذي تريد الدخول إليه:",
+            reply_markup=main_menu()
+        )
+
+        return
+
     await update.message.reply_text(
         "🦁 أهلاً بك في بوت الأسد\n\n"
+        "🔐 هذا البوت مخصص للمشتركين فقط.\n\n"
+        "أرسل كود التفعيل الخاص بك لتفعيل الحساب."
+    )
+
+
+# =========================================================
+# تفعيل الكود
+# =========================================================
+
+async def activation_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    # إذا كان المستخدم مفعلاً بالفعل
+    if is_activated(user_id):
+        return
+
+    code = update.message.text.strip().upper()
+
+    # نتأكد أنه يبدو ككود بوت الأسد
+    if not code.startswith("LION-"):
+
+        await update.message.reply_text(
+            "🔐 أرسل كود التفعيل بالشكل الصحيح."
+        )
+
+        return
+
+    success = activate_code(code, user_id)
+
+    if not success:
+
+        await update.message.reply_text(
+            "❌ كود التفعيل غير صحيح أو تم استخدامه مسبقاً.\n\n"
+            "تأكد من الكود وحاول مرة أخرى."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "✅ تم تفعيل حسابك بنجاح.\n\n"
+        "🦁 أهلاً بك في بوت الأسد\n"
         "اختر السوق الذي تريد الدخول إليه:",
         reply_markup=main_menu()
     )
 
 
+# =========================================================
+# إنشاء أكواد للعملاء - للإدارة فقط
+# =========================================================
+
+async def new_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_ID:
+
+        await update.message.reply_text(
+            "⛔ هذا الأمر مخصص للإدارة فقط."
+        )
+
+        return
+
+    code = create_access_code()
+
+    await update.message.reply_text(
+        "🎟 تم إنشاء كود تفعيل جديد\n\n"
+        f"🔐 الكود:\n{code}\n\n"
+        "يمكن استخدامه مرة واحدة فقط."
+    )
+
+
+# =========================================================
+# إرسال الإشارة
+# =========================================================
+
 async def send_signal(query, pair):
+
     user_id = query.from_user.id
+
+    # حماية إضافية
+    if not is_activated(user_id):
+
+        await query.message.reply_text(
+            "🔐 يجب تفعيل حسابك أولاً."
+        )
+
+        return
+
     now = time.time()
 
     if user_id in last_signal_time:
+
         elapsed = now - last_signal_time[user_id]
 
         if elapsed < SIGNAL_COOLDOWN:
-            remaining = int(SIGNAL_COOLDOWN - elapsed)
+
+            remaining = int(
+                SIGNAL_COOLDOWN - elapsed
+            )
 
             await query.message.reply_text(
                 f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية."
             )
+
             return
 
     last_signal_time[user_id] = now
 
-    direction = random.choice(["🟢 BUY", "🔴 SELL"])
+    direction = random.choice([
+        "🟢 BUY",
+        "🔴 SELL"
+    ])
+
     duration = random.randint(1, 15)
 
     keyboard = [
-        [InlineKeyboardButton("🔄 إشارة ثانية", callback_data="new_signal")]
+        [
+            InlineKeyboardButton(
+                "🔄 إشارة ثانية",
+                callback_data="new_signal"
+            )
+        ]
     ]
 
     await query.message.reply_text(
+
         "🦁 إشارة الأسد\n\n"
+
         f"💱 السوق: {pair}\n"
+
         f"📈 الاتجاه: {direction}\n"
+
         f"⏱ المدة: {duration} دقيقة\n\n"
+
         "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
+
         "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
         "لا تعتبر الإشارة توصية استثمارية.",
+
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# التعامل مع الأزرار
+# =========================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
+
     await query.answer()
+
+    user_id = query.from_user.id
+
+    # منع أي شخص غير مفعّل من استخدام الأزرار
+    if not is_activated(user_id):
+
+        await query.message.reply_text(
+            "🔐 حسابك غير مفعّل.\n"
+            "أرسل كود التفعيل أولاً."
+        )
+
+        return
 
     data = query.data
 
-    if data == "markets" or data == "new_signal":
+    if data == "markets":
+
+        await query.message.reply_text(
+            "🦁 اختر السوق:",
+            reply_markup=main_menu()
+        )
+
+    elif data == "new_signal":
+
         await query.message.reply_text(
             "🦁 اختر السوق:",
             reply_markup=main_menu()
         )
 
     elif data == "real":
+
         await query.message.reply_text(
             "📈 اختر زوج العملات:",
-            reply_markup=pair_menu(REAL_PAIRS, "realpair")
+            reply_markup=pair_menu(
+                REAL_PAIRS,
+                "realpair"
+            )
         )
 
     elif data == "otc":
+
         await query.message.reply_text(
             "🟣 اختر زوج OTC:",
-            reply_markup=pair_menu(OTC_PAIRS, "otcpair")
+            reply_markup=pair_menu(
+                OTC_PAIRS,
+                "otcpair"
+            )
         )
 
     elif data.startswith("realpair:"):
-        index = int(data.split(":")[1])
-        await send_signal(query, REAL_PAIRS[index])
+
+        index = int(
+            data.split(":")[1]
+        )
+
+        if index < 0 or index >= len(REAL_PAIRS):
+            return
+
+        await send_signal(
+            query,
+            REAL_PAIRS[index]
+        )
 
     elif data.startswith("otcpair:"):
-        index = int(data.split(":")[1])
-        await send_signal(query, OTC_PAIRS[index])
+
+        index = int(
+            data.split(":")[1]
+        )
+
+        if index < 0 or index >= len(OTC_PAIRS):
+            return
+
+        await send_signal(
+            query,
+            OTC_PAIRS[index]
+        )
 
     elif data == "warning":
+
         await query.message.reply_text(
+
             "⚠️ تحذير المخاطر\n\n"
+
             "التداول ينطوي على مخاطر مالية عالية.\n"
             "لا تعتبر الإشارات توصية استثمارية.\n"
             "استخدم رأس مال تستطيع تحمل خسارته."
         )
 
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+# =========================================================
+# تشغيل البوت
+# =========================================================
 
+def main():
+
+    if not TOKEN:
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set"
+        )
+
+    # إنشاء قاعدة البيانات والجداول
+    init_db()
+
+    # تشغيل Health Server
     threading.Thread(
         target=start_health_server,
         daemon=True
     ).start()
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # أمر البداية
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    # أمر إنشاء كود جديد للإدارة
+    app.add_handler(
+        CommandHandler(
+            "newcode",
+            new_code
+        )
+    )
+
+    # استقبال كود التفعيل
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            activation_handler
+        )
+    )
+
+    # أزرار البوت
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
 
     print("Bot started")
 
