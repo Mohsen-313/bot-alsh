@@ -1154,6 +1154,12 @@ async def send_signal(query, pair):
         ],
         [
             InlineKeyboardButton(
+                "📢 القناة الأساسية",
+                url="https://t.me/gold302r"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "🏠 الرئيسية",
                 callback_data="home"
             )
@@ -1167,8 +1173,10 @@ async def send_signal(query, pair):
         f"📈 <b>الاتجاه:</b> {direction}\n"
         f"⏱ <b>المدة:</b> {duration} دقيقة\n"
         "━━━━━━━━━━━━━━\n\n"
-        "⚠️ الإشارة عشوائية وليست توصية استثمارية.\n"
-        "التداول ينطوي على مخاطر مالية."
+        "⚡ <b>الدخول: فور ظهور الإشارة</b>\n\n"
+        "⚠️ <b>تحذير</b>\n"
+        "الدخول على مسؤوليتك، والتداول ينطوي على مخاطر مالية.\n"
+        "ادخل برأس مال تستطيع تحمّل خسارته."
     )
 
     try:
