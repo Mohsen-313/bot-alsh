@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import secrets
@@ -1056,23 +1057,58 @@ async def send_signal(query, pair):
         )
         return
 
+    # =====================================================
+    # منع إصدار إشارة ثانية قبل مرور دقيقتين
+    # يبدأ العد من لحظة ظهور الإشارة السابقة، وليس من
+    # لحظة الضغط عليها.
+    # =====================================================
+
     now = time.time()
 
     if user_id in last_signal_time:
         elapsed = now - last_signal_time[user_id]
 
         if elapsed < SIGNAL_COOLDOWN:
-            remaining = int(SIGNAL_COOLDOWN - elapsed)
+            remaining = max(1, int(SIGNAL_COOLDOWN - elapsed))
 
-            await query.answer(
-                f"⏳ انتظر {remaining} ثانية قبل طلب إشارة جديدة.",
-                show_alert=True
+            minutes = remaining // 60
+            seconds = remaining % 60
+
+            if minutes:
+                wait_text = f"{minutes} دقيقة و{seconds} ثانية"
+            else:
+                wait_text = f"{seconds} ثانية"
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📊 اختيار سوق",
+                        callback_data="markets"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+
+            await query.edit_message_text(
+                "⏳ <b>الإشارة التالية غير متاحة الآن</b>\n\n"
+                f"يمكنك طلب إشارة جديدة بعد:\n"
+                f"🕐 <b>{wait_text}</b>\n\n"
+                "هذا لمنع تداخل الإشارات.",
+                reply_markup=keyboard,
+                parse_mode="HTML"
             )
+
             return
 
-    last_signal_time[user_id] = now
+    # =====================================================
+    # شاشة تجهيز الإشارة
+    # =====================================================
 
-    # تجهيز بصري صادق: البوت يجهز الإشارة، ولا يدعي وجود تحليل حقيقي.
     loading_messages = [
         "📊 <b>جاري تجهيز الإشارة...</b>\n\n⏳ يرجى الانتظار...",
         "🔄 <b>جاري معالجة الطلب...</b>\n\n⏳ يتم تجهيز الإشارة...",
@@ -1092,7 +1128,6 @@ async def send_signal(query, pair):
 
         started = time.monotonic()
 
-        # نغير الرسالة أثناء الانتظار دون تكديس رسائل.
         stages = [
             (0.0, loading_messages[0]),
             (0.35, loading_messages[1]),
@@ -1105,7 +1140,7 @@ async def send_signal(query, pair):
             wait_for = target - elapsed
 
             if wait_for > 0:
-                await __import__("asyncio").sleep(wait_for)
+                await asyncio.sleep(wait_for)
 
             try:
                 await query.edit_message_text(
@@ -1118,10 +1153,15 @@ async def send_signal(query, pair):
         remaining = delay - (time.monotonic() - started)
 
         if remaining > 0:
-            await __import__("asyncio").sleep(remaining)
+            await asyncio.sleep(remaining)
 
     except Exception:
+        # إذا تعذر تعديل رسالة التحميل، لا نوقف إصدار الإشارة.
         pass
+
+    # =====================================================
+    # إنشاء الإشارة
+    # =====================================================
 
     direction = random.choice([
         "🟢 BUY",
@@ -1137,7 +1177,8 @@ async def send_signal(query, pair):
         duration
     )
 
-    direction_text = "BUY" if "BUY" in direction else "SELL"
+    # يبدأ عداد الدقيقتين من لحظة ظهور الإشارة.
+    last_signal_time[user_id] = time.time()
 
     keyboard = [
         [
