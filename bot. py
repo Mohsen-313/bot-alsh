@@ -17,10 +17,21 @@ from telegram.ext import (
     filters,
 )
 
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# =========================================================
+# ADMIN
+# =========================================================
+
 ADMIN_ID = 8557636222
+
 DB_FILE = os.getenv("DB_FILE", "bot.db")
+
+
+# =========================================================
+# الأسواق
+# =========================================================
 
 REAL_PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
@@ -34,6 +45,7 @@ REAL_PAIRS = [
 OTC_PAIRS = [f"{pair} OTC" for pair in REAL_PAIRS]
 
 SIGNAL_COOLDOWN = 120
+
 last_signal_time = {}
 
 
@@ -46,6 +58,7 @@ def db_connect():
 
 
 def init_db():
+
     conn = db_connect()
     cursor = conn.cursor()
 
@@ -73,6 +86,7 @@ def is_admin(user_id):
 
 
 def is_activated(user_id):
+
     conn = db_connect()
     cursor = conn.cursor()
 
@@ -82,18 +96,21 @@ def is_activated(user_id):
     )
 
     result = cursor.fetchone()
+
     conn.close()
 
     return result is not None
 
 
 def activate_code(code, user_id):
+
     code = code.strip().upper()
 
     conn = db_connect()
     cursor = conn.cursor()
 
     try:
+
         cursor.execute("BEGIN IMMEDIATE")
 
         cursor.execute(
@@ -104,13 +121,17 @@ def activate_code(code, user_id):
         result = cursor.fetchone()
 
         if not result:
+
             conn.rollback()
             conn.close()
+
             return False
 
         if result[0] is not None:
+
             conn.rollback()
             conn.close()
+
             return False
 
         now = datetime.now(timezone.utc).isoformat()
@@ -126,7 +147,8 @@ def activate_code(code, user_id):
 
         cursor.execute(
             """
-            INSERT OR IGNORE INTO users (user_id, activated_at)
+            INSERT OR IGNORE INTO users
+            (user_id, activated_at)
             VALUES (?, ?)
             """,
             (user_id, now)
@@ -138,13 +160,17 @@ def activate_code(code, user_id):
         return True
 
     except Exception:
+
         conn.rollback()
         conn.close()
+
         return False
 
 
 def create_access_code():
+
     while True:
+
         code = "LION-" + secrets.token_hex(4).upper()
 
         conn = db_connect()
@@ -158,6 +184,7 @@ def create_access_code():
         exists = cursor.fetchone()
 
         if not exists:
+
             cursor.execute(
                 "INSERT INTO access_codes (code) VALUES (?)",
                 (code,)
@@ -172,6 +199,52 @@ def create_access_code():
 
 
 # =========================================================
+# حذف مستخدم
+# =========================================================
+
+def delete_user(user_id):
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+
+    deleted = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+# =========================================================
+# قائمة المشتركين
+# =========================================================
+
+def get_users():
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT user_id, activated_at
+        FROM users
+        ORDER BY activated_at DESC
+        """
+    )
+
+    users = cursor.fetchall()
+
+    conn.close()
+
+    return users
+
+
+# =========================================================
 # إحصائيات الإدارة
 # =========================================================
 
@@ -180,22 +253,38 @@ def get_statistics():
     conn = db_connect()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM users")
+    cursor.execute(
+        "SELECT COUNT(*) FROM users"
+    )
+
     users_count = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM access_codes")
+    cursor.execute(
+        "SELECT COUNT(*) FROM access_codes"
+    )
+
     total_codes = cursor.fetchone()[0]
 
     cursor.execute(
-        "SELECT COUNT(*) FROM access_codes WHERE used_by IS NOT NULL"
+        """
+        SELECT COUNT(*)
+        FROM access_codes
+        WHERE used_by IS NOT NULL
+        """
     )
+
     used_codes = cursor.fetchone()[0]
 
     unused_codes = total_codes - used_codes
 
     conn.close()
 
-    return users_count, total_codes, used_codes, unused_codes
+    return (
+        users_count,
+        total_codes,
+        used_codes,
+        unused_codes
+    )
 
 
 # =========================================================
@@ -205,9 +294,13 @@ def get_statistics():
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+
+        self.wfile.write(
+            b"Bot is running"
+        )
 
     def log_message(self, format, *args):
         pass
@@ -215,7 +308,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
 
-    port = int(os.getenv("PORT", "10000"))
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
 
     server = HTTPServer(
         ("0.0.0.0", port),
@@ -244,30 +342,34 @@ def start_menu():
 
 
 # =========================================================
-# قوائم العملاء
+# قائمة العملاء
 # =========================================================
 
 def main_menu():
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "📈 الأسواق الحقيقية",
                 callback_data="real"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🟣 أسواق OTC",
                 callback_data="otc"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "⚠️ تحذير المخاطر",
                 callback_data="warning"
             )
         ]
+
     ]
 
     return InlineKeyboardMarkup(keyboard)
@@ -277,32 +379,44 @@ def pair_menu(pairs, prefix):
 
     keyboard = []
 
-    for i in range(0, len(pairs), 2):
+    for i in range(
+        0,
+        len(pairs),
+        2
+    ):
 
         row = [
+
             InlineKeyboardButton(
                 pairs[i],
                 callback_data=f"{prefix}:{i}"
             )
+
         ]
 
         if i + 1 < len(pairs):
 
             row.append(
+
                 InlineKeyboardButton(
                     pairs[i + 1],
                     callback_data=f"{prefix}:{i + 1}"
                 )
+
             )
 
         keyboard.append(row)
 
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 رجوع للأسواق",
-            callback_data="markets"
-        )
-    ])
+    keyboard.append(
+
+        [
+            InlineKeyboardButton(
+                "🔙 رجوع للأسواق",
+                callback_data="markets"
+            )
+        ]
+
+    )
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -314,24 +428,35 @@ def pair_menu(pairs, prefix):
 def admin_menu():
 
     keyboard = [
+
         [
             InlineKeyboardButton(
-                "👥 عدد المشتركين",
+                "👥 المشتركين",
                 callback_data="admin_users"
             )
         ],
+
+        [
+            InlineKeyboardButton(
+                "🚫 حذف مشترك",
+                callback_data="admin_delete"
+            )
+        ],
+
         [
             InlineKeyboardButton(
                 "🎟 إنشاء كود جديد",
                 callback_data="admin_newcode"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "📊 الإحصائيات",
                 callback_data="admin_stats"
             )
         ]
+
     ]
 
     return InlineKeyboardMarkup(keyboard)
@@ -344,8 +469,11 @@ def admin_menu():
 async def delete_old_message(query):
 
     try:
+
         await query.message.delete()
+
     except Exception:
+
         pass
 
 
@@ -353,16 +481,22 @@ async def delete_old_message(query):
 # /start
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
     if is_admin(user_id):
 
         await update.message.reply_text(
+
             "👑 أهلاً بك يا مدير بوت الأسد.\n\n"
             "اختر من لوحة الإدارة:",
+
             reply_markup=admin_menu()
+
         )
 
         return
@@ -370,17 +504,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_activated(user_id):
 
         await update.message.reply_text(
+
             "🦁 أهلاً بك في بوت الأسد\n\n"
             "اضغط على الزر للبدء:",
+
             reply_markup=start_menu()
+
         )
 
         return
 
     await update.message.reply_text(
+
         "🦁 أهلاً بك في بوت الأسد\n\n"
         "🔐 هذا البوت مخصص للمشتركين فقط.\n\n"
         "أرسل كود التفعيل الخاص بك لتفعيل الحساب."
+
     )
 
 
@@ -388,7 +527,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /admin
 # =========================================================
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
@@ -401,9 +543,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
+
         "👑 لوحة إدارة بوت الأسد\n\n"
         "اختر العملية التي تريد تنفيذها:",
+
         reply_markup=admin_menu()
+
     )
 
 
@@ -411,7 +556,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # إنشاء كود
 # =========================================================
 
-async def new_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def new_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
@@ -426,55 +574,264 @@ async def new_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = create_access_code()
 
     await update.message.reply_text(
+
         "🎟 تم إنشاء كود تفعيل جديد\n\n"
         f"🔐 الكود:\n{code}\n\n"
         "♻️ يمكن استخدامه مرة واحدة فقط."
+
     )
 
 
 # =========================================================
-# استقبال كود العميل
+# استقبال رسائل المستخدم
 # =========================================================
 
-async def activation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def activation_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not update.message:
         return
 
     user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # =====================================================
+    # الأدمن - حذف مستخدم
+    # =====================================================
 
     if is_admin(user_id):
+
+        if context.user_data.get(
+            "waiting_delete_id"
+        ):
+
+            context.user_data[
+                "waiting_delete_id"
+            ] = False
+
+            try:
+
+                target_id = int(text)
+
+            except ValueError:
+
+                await update.message.reply_text(
+
+                    "❌ الـID غير صحيح.\n\n"
+                    "أرسل Telegram ID رقمي فقط.",
+
+                    reply_markup=admin_menu()
+
+                )
+
+                return
+
+            if target_id == ADMIN_ID:
+
+                await update.message.reply_text(
+
+                    "⛔ لا يمكنك حذف حساب الأدمن.",
+
+                    reply_markup=admin_menu()
+
+                )
+
+                return
+
+            if not is_activated(target_id):
+
+                await update.message.reply_text(
+
+                    "❌ هذا الـID غير موجود ضمن المشتركين المفعّلين.",
+
+                    reply_markup=admin_menu()
+
+                )
+
+                return
+
+            keyboard = [
+
+                [
+
+                    InlineKeyboardButton(
+                        "✅ نعم، احذف",
+                        callback_data=f"confirm_delete:{target_id}"
+                    )
+
+                ],
+
+                [
+
+                    InlineKeyboardButton(
+                        "❌ إلغاء",
+                        callback_data="cancel_delete"
+                    )
+
+                ]
+
+            ]
+
+            await update.message.reply_text(
+
+                "⚠️ تأكيد حذف المشترك\n\n"
+                f"🆔 ID: {target_id}\n\n"
+                "هل تريد حذف هذا المشترك؟",
+
+                reply_markup=InlineKeyboardMarkup(
+                    keyboard
+                )
+
+            )
+
+            return
+
+        # الأدمن لا يحتاج إرسال الأكواد
         return
+
+    # =====================================================
+    # المستخدم مفعل مسبقاً
+    # =====================================================
 
     if is_activated(user_id):
         return
 
-    code = update.message.text.strip().upper()
+    code = text.upper()
 
     if not code.startswith("LION-"):
 
         await update.message.reply_text(
+
             "🔐 أرسل كود التفعيل بالشكل الصحيح."
+
         )
 
         return
 
-    success = activate_code(code, user_id)
+    success = activate_code(
+        code,
+        user_id
+    )
 
     if not success:
 
         await update.message.reply_text(
+
             "❌ كود التفعيل غير صحيح أو تم استخدامه مسبقاً.\n\n"
             "تأكد من الكود وحاول مرة أخرى."
+
         )
 
         return
 
     await update.message.reply_text(
+
         "✅ تم تفعيل حسابك بنجاح.\n\n"
         "🦁 أهلاً بك في بوت الأسد\n\n"
         "اضغط على الزر للبدء:",
+
         reply_markup=start_menu()
+
+    )
+
+
+# =========================================================
+# إرسال الإشارة
+# =========================================================
+
+async def send_signal(
+    query,
+    pair
+):
+
+    user_id = query.from_user.id
+
+    if not is_admin(user_id) and not is_activated(user_id):
+
+        await query.message.reply_text(
+            "🔐 يجب تفعيل حسابك أولاً."
+        )
+
+        return
+
+    now = time.time()
+
+    if user_id in last_signal_time:
+
+        elapsed = (
+            now -
+            last_signal_time[user_id]
+        )
+
+        if elapsed < SIGNAL_COOLDOWN:
+
+            remaining = int(
+                SIGNAL_COOLDOWN -
+                elapsed
+            )
+
+            await delete_old_message(query)
+
+            await query.message.chat.send_message(
+
+                f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية.",
+
+                reply_markup=main_menu()
+
+            )
+
+            return
+
+    last_signal_time[user_id] = now
+
+    direction = random.choice(
+        [
+            "🟢 BUY",
+            "🔴 SELL"
+        ]
+    )
+
+    duration = random.randint(
+        1,
+        15
+    )
+
+    keyboard = [
+
+        [
+
+            InlineKeyboardButton(
+                "🔄 إشارة ثانية",
+                callback_data="new_signal"
+            )
+
+        ]
+
+    ]
+
+    await delete_old_message(query)
+
+    await query.message.chat.send_message(
+
+        "🦁 إشارة الأسد\n\n"
+
+        f"💱 السوق: {pair}\n"
+
+        f"📈 الاتجاه: {direction}\n"
+
+        f"⏱ المدة: {duration} دقيقة\n\n"
+
+        "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
+
+        "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
+        "هذه إشارة عشوائية وليست توصية استثمارية.",
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
+
     )
 
 
@@ -482,7 +839,10 @@ async def activation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # الأزرار
 # =========================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     query = update.callback_query
 
@@ -505,42 +865,239 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return
 
+        # =================================================
+        # المشتركين
+        # =================================================
+
         if data == "admin_users":
 
-            users_count, total, used, unused = get_statistics()
+            users = get_users()
+
+            if not users:
+
+                await query.message.reply_text(
+
+                    "👥 لا يوجد مشتركون مفعّلون حالياً.",
+
+                    reply_markup=admin_menu()
+
+                )
+
+                return
+
+            text = (
+                "👥 قائمة المشتركين\n\n"
+                f"📊 العدد: {len(users)}\n\n"
+            )
+
+            for index, user in enumerate(
+                users,
+                start=1
+            ):
+
+                user_id_value = user[0]
+
+                text += (
+                    f"{index}. 🆔 `{user_id_value}`\n"
+                )
+
+            # تقسيم الرسالة إذا كانت طويلة
+            if len(text) > 3900:
+
+                chunks = []
+
+                current = ""
+
+                for line in text.splitlines(
+                    keepends=True
+                ):
+
+                    if len(current) + len(line) > 3900:
+
+                        chunks.append(current)
+                        current = ""
+
+                    current += line
+
+                if current:
+                    chunks.append(current)
+
+                for chunk in chunks:
+
+                    await query.message.reply_text(
+                        chunk,
+                        parse_mode="Markdown"
+                    )
+
+                await query.message.reply_text(
+                    "اختر عملية أخرى:",
+                    reply_markup=admin_menu()
+                )
+
+            else:
+
+                await query.message.reply_text(
+
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=admin_menu()
+
+                )
+
+            return
+
+        # =================================================
+        # طلب حذف مشترك
+        # =================================================
+
+        if data == "admin_delete":
+
+            context.user_data[
+                "waiting_delete_id"
+            ] = True
 
             await query.message.reply_text(
-                "👥 عدد المشتركين\n\n"
-                f"👤 المشتركين المفعّلين: {users_count}"
+
+                "🚫 حذف مشترك\n\n"
+                "أرسل Telegram ID الخاص بالمشترك الذي تريد حذفه.\n\n"
+                "مثال:\n"
+                "`123456789`",
+
+                parse_mode="Markdown"
+
             )
 
             return
+
+        # =================================================
+        # إنشاء كود
+        # =================================================
 
         if data == "admin_newcode":
 
             code = create_access_code()
 
             await query.message.reply_text(
+
                 "🎟 تم إنشاء كود جديد\n\n"
                 f"🔐 {code}\n\n"
-                "♻️ صالح للاستخدام مرة واحدة فقط."
+                "♻️ صالح للاستخدام مرة واحدة فقط.",
+
+                reply_markup=admin_menu()
+
             )
 
             return
+
+        # =================================================
+        # الإحصائيات
+        # =================================================
 
         if data == "admin_stats":
 
             users_count, total, used, unused = get_statistics()
 
             await query.message.reply_text(
+
                 "📊 إحصائيات بوت الأسد\n\n"
+
                 f"👥 المشتركين: {users_count}\n"
                 f"🎟 إجمالي الأكواد: {total}\n"
                 f"✅ الأكواد المستخدمة: {used}\n"
-                f"🟢 الأكواد المتبقية: {unused}"
+                f"🟢 الأكواد المتبقية: {unused}",
+
+                reply_markup=admin_menu()
+
             )
 
             return
+
+    # =====================================================
+    # تأكيد حذف المستخدم
+    # =====================================================
+
+    if data.startswith("confirm_delete:"):
+
+        if not is_admin(user_id):
+
+            await query.message.reply_text(
+                "⛔ هذا القسم مخصص للإدارة فقط."
+            )
+
+            return
+
+        target_id = int(
+            data.split(":")[1]
+        )
+
+        deleted = delete_user(
+            target_id
+        )
+
+        if deleted:
+
+            # حذف وقت الإشارة إن وجد
+            last_signal_time.pop(
+                target_id,
+                None
+            )
+
+            await delete_old_message(query)
+
+            await context.bot.send_message(
+
+                chat_id=user_id,
+
+                text=(
+                    "✅ تم حذف المشترك بنجاح.\n\n"
+                    f"🆔 ID: {target_id}\n\n"
+                    "🔒 لم يعد لديه وصول إلى البوت."
+                ),
+
+                reply_markup=admin_menu()
+
+            )
+
+        else:
+
+            await delete_old_message(query)
+
+            await context.bot.send_message(
+
+                chat_id=user_id,
+
+                text=(
+                    "❌ لم يتم العثور على هذا المشترك."
+                ),
+
+                reply_markup=admin_menu()
+
+            )
+
+        return
+
+    # =====================================================
+    # إلغاء الحذف
+    # =====================================================
+
+    if data == "cancel_delete":
+
+        if not is_admin(user_id):
+            return
+
+        await delete_old_message(query)
+
+        await context.bot.send_message(
+
+            chat_id=user_id,
+
+            text="❌ تم إلغاء عملية الحذف.",
+
+            reply_markup=admin_menu()
+
+        )
+
+        return
 
     # =====================================================
     # منع العميل غير المفعل
@@ -549,8 +1106,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id) and not is_activated(user_id):
 
         await query.message.reply_text(
+
             "🔐 حسابك غير مفعّل.\n"
             "أرسل كود التفعيل أولاً."
+
         )
 
         return
@@ -564,9 +1123,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         await context.bot.send_message(
+
             chat_id=user_id,
+
             text="🦁 اختر السوق:",
+
             reply_markup=main_menu()
+
         )
 
         return
@@ -580,9 +1143,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         await context.bot.send_message(
+
             chat_id=user_id,
+
             text="🦁 اختر السوق:",
+
             reply_markup=main_menu()
+
         )
 
         return
@@ -596,9 +1163,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         await context.bot.send_message(
+
             chat_id=user_id,
+
             text="🦁 اختر السوق:",
+
             reply_markup=main_menu()
+
         )
 
         return
@@ -612,12 +1183,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         await context.bot.send_message(
+
             chat_id=user_id,
+
             text="📈 اختر زوج العملات:",
+
             reply_markup=pair_menu(
                 REAL_PAIRS,
                 "realpair"
             )
+
         )
 
         return
@@ -631,12 +1206,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         await context.bot.send_message(
+
             chat_id=user_id,
+
             text="🟣 اختر زوج OTC:",
+
             reply_markup=pair_menu(
                 OTC_PAIRS,
                 "otcpair"
             )
+
         )
 
         return
@@ -647,67 +1226,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("realpair:"):
 
-        index = int(data.split(":")[1])
+        index = int(
+            data.split(":")[1]
+        )
 
         if index < 0 or index >= len(REAL_PAIRS):
             return
 
-        now = time.time()
-
-        if user_id in last_signal_time:
-
-            elapsed = now - last_signal_time[user_id]
-
-            if elapsed < SIGNAL_COOLDOWN:
-
-                remaining = int(
-                    SIGNAL_COOLDOWN - elapsed
-                )
-
-                await delete_old_message(query)
-
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية.",
-                    reply_markup=main_menu()
-                )
-
-                return
-
-        last_signal_time[user_id] = now
-
-        await delete_old_message(query)
-
-        direction = random.choice([
-            "🟢 BUY",
-            "🔴 SELL"
-        ])
-
-        duration = random.randint(1, 15)
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🔄 إشارة ثانية",
-                    callback_data="new_signal"
-                )
-            ]
-        ]
-
-        await context.bot.send_message(
-            chat_id=user_id,
-
-            text=(
-                "🦁 إشارة الأسد\n\n"
-                f"💱 السوق: {REAL_PAIRS[index]}\n"
-                f"📈 الاتجاه: {direction}\n"
-                f"⏱ المدة: {duration} دقيقة\n\n"
-                "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
-                "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
-                "هذه إشارة عشوائية وليست توصية استثمارية."
-            ),
-
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        await send_signal(
+            query,
+            REAL_PAIRS[index]
         )
 
         return
@@ -718,67 +1246,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("otcpair:"):
 
-        index = int(data.split(":")[1])
+        index = int(
+            data.split(":")[1]
+        )
 
         if index < 0 or index >= len(OTC_PAIRS):
             return
 
-        now = time.time()
-
-        if user_id in last_signal_time:
-
-            elapsed = now - last_signal_time[user_id]
-
-            if elapsed < SIGNAL_COOLDOWN:
-
-                remaining = int(
-                    SIGNAL_COOLDOWN - elapsed
-                )
-
-                await delete_old_message(query)
-
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية.",
-                    reply_markup=main_menu()
-                )
-
-                return
-
-        last_signal_time[user_id] = now
-
-        await delete_old_message(query)
-
-        direction = random.choice([
-            "🟢 BUY",
-            "🔴 SELL"
-        ])
-
-        duration = random.randint(1, 15)
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🔄 إشارة ثانية",
-                    callback_data="new_signal"
-                )
-            ]
-        ]
-
-        await context.bot.send_message(
-            chat_id=user_id,
-
-            text=(
-                "🦁 إشارة الأسد\n\n"
-                f"💱 السوق: {OTC_PAIRS[index]}\n"
-                f"📈 الاتجاه: {direction}\n"
-                f"⏱ المدة: {duration} دقيقة\n\n"
-                "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
-                "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
-                "هذه إشارة عشوائية وليست توصية استثمارية."
-            ),
-
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        await send_signal(
+            query,
+            OTC_PAIRS[index]
         )
 
         return
@@ -792,26 +1269,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_old_message(query)
 
         keyboard = [
+
             [
+
                 InlineKeyboardButton(
                     "🔙 رجوع للأسواق",
                     callback_data="markets"
                 )
+
             ]
+
         ]
 
         await context.bot.send_message(
+
             chat_id=user_id,
 
             text=(
+
                 "⚠️ تحذير المخاطر\n\n"
+
                 "التداول ينطوي على مخاطر مالية عالية.\n"
-                "الإشارات الموجودة في هذا البوت عشوائية "
-                "وليست توصية استثمارية.\n\n"
+
+                "الإشارات الموجودة في هذا البوت "
+                "عشوائية وليست توصية استثمارية.\n\n"
+
                 "استخدم رأس مال تستطيع تحمل خسارته."
+
             ),
 
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+
         )
 
         return
@@ -843,6 +1333,7 @@ def main():
         .build()
     )
 
+    # /start
     app.add_handler(
         CommandHandler(
             "start",
@@ -850,6 +1341,7 @@ def main():
         )
     )
 
+    # /admin
     app.add_handler(
         CommandHandler(
             "admin",
@@ -857,6 +1349,7 @@ def main():
         )
     )
 
+    # /newcode
     app.add_handler(
         CommandHandler(
             "newcode",
@@ -864,6 +1357,7 @@ def main():
         )
     )
 
+    # الرسائل النصية
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -871,6 +1365,7 @@ def main():
         )
     )
 
+    # الأزرار
     app.add_handler(
         CallbackQueryHandler(
             button_handler
