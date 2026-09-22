@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,16 +18,33 @@ from telegram.ext import (
     filters,
 )
 
+# =========================================================
+# CONFIG
+# =========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# =========================================================
-# ADMIN
-# =========================================================
-
+# ضع Telegram ID الخاص بك هنا
 ADMIN_ID = 8557636222
 
-DB_FILE = os.getenv("DB_FILE", "bot.db")
+# إذا كان Render Persistent Disk مركبًا على /var/data
+# يمكنك وضع DB_FILE=/var/data/bot.db في Environment Variables.
+DB_FILE = os.getenv(
+    "DB_FILE",
+    "/var/data/bot.db" if os.path.isdir("/var/data") else "bot.db"
+)
+
+BOT_NAME = "بوت الأسد"
+
+# مدة تجهيز الإشارة: عشوائية بين 5 و15 ثانية
+MIN_SIGNAL_DELAY = 5
+MAX_SIGNAL_DELAY = 15
+
+# منع طلب إشارات متتابعة بسرعة
+SIGNAL_COOLDOWN = 120
+
+# عدد الرسائل التي نحاول الاحتفاظ بها للتنظيف
+MAX_TRACKED_MESSAGES = 40
 
 
 # =========================================================
@@ -44,26 +62,44 @@ REAL_PAIRS = [
 
 OTC_PAIRS = [f"{pair} OTC" for pair in REAL_PAIRS]
 
-SIGNAL_COOLDOWN = 120
-last_signal_time = {}
+
+# =========================================================
+# أدوات عامة
+# =========================================================
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_connect():
+    # timeout يساعد عند وجود أكثر من عملية SQLite في نفس الوقت.
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
 
 # =========================================================
 # قاعدة البيانات
 # =========================================================
 
-def db_connect():
-    return sqlite3.connect(DB_FILE)
-
-
 def init_db():
+    folder = os.path.dirname(DB_FILE)
+
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
     conn = db_connect()
     cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            activated_at TEXT NOT NULL
+            activated_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
         )
     """)
 
@@ -75,15 +111,72 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_messages (
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, chat_id, message_id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signal_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            duration INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, pair)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('maintenance', '0')
+    """)
+
     conn.commit()
     conn.close()
 
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
+# =========================================================
+# المستخدمون
+# =========================================================
 
 def is_activated(user_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT active FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return bool(result and result[0] == 1)
+
+
+def user_exists(user_id):
     conn = db_connect()
     cursor = conn.cursor()
 
@@ -93,10 +186,47 @@ def is_activated(user_id):
     )
 
     result = cursor.fetchone()
-
     conn.close()
 
     return result is not None
+
+
+def activate_existing_user(user_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE users SET active = 1 WHERE user_id = ?",
+        (user_id,)
+    )
+
+    changed = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return changed
+
+
+def deactivate_user(user_id):
+    """
+    إيقاف العضو فقط.
+    لا نحذف السجل، لذلك يستطيع الأدمن إعادته بدون كود جديد.
+    """
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE users SET active = 0 WHERE user_id = ?",
+        (user_id,)
+    )
+
+    changed = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return changed
 
 
 def activate_code(code, user_id):
@@ -108,6 +238,25 @@ def activate_code(code, user_id):
     try:
         cursor.execute("BEGIN IMMEDIATE")
 
+        # إذا كان الحساب موجودًا وموقوفًا، لا نستهلك كودًا جديدًا.
+        cursor.execute(
+            "SELECT active FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        existing_user = cursor.fetchone()
+
+        if existing_user:
+            if existing_user[0] == 1:
+                conn.rollback()
+                conn.close()
+                return "already_active"
+
+            # المستخدم موجود لكنه موقوف.
+            # لا نسمح باستخدام كود جديد لتجاوز قرار الإدارة.
+            conn.rollback()
+            conn.close()
+            return "suspended"
+
         cursor.execute(
             "SELECT used_by FROM access_codes WHERE code = ?",
             (code,)
@@ -118,14 +267,14 @@ def activate_code(code, user_id):
         if not result:
             conn.rollback()
             conn.close()
-            return False
+            return "invalid"
 
         if result[0] is not None:
             conn.rollback()
             conn.close()
-            return False
+            return "used"
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now()
 
         cursor.execute(
             """
@@ -136,10 +285,15 @@ def activate_code(code, user_id):
             (user_id, now, code)
         )
 
+        if cursor.rowcount != 1:
+            conn.rollback()
+            conn.close()
+            return "used"
+
         cursor.execute(
             """
-            INSERT OR IGNORE INTO users (user_id, activated_at)
-            VALUES (?, ?)
+            INSERT INTO users (user_id, activated_at, active)
+            VALUES (?, ?, 1)
             """,
             (user_id, now)
         )
@@ -147,17 +301,50 @@ def activate_code(code, user_id):
         conn.commit()
         conn.close()
 
-        return True
+        return "success"
 
     except Exception:
         conn.rollback()
         conn.close()
-        return False
+        return "error"
 
+
+def get_subscribers():
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT user_id, activated_at, active
+        FROM users
+        ORDER BY activated_at DESC
+    """)
+
+    users = cursor.fetchall()
+    conn.close()
+
+    return users
+
+
+def get_active_users():
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT user_id FROM users WHERE active = 1"
+    )
+
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    return users
+
+
+# =========================================================
+# الأكواد
+# =========================================================
 
 def create_access_code():
     while True:
-
         code = "LION-" + secrets.token_hex(4).upper()
 
         conn = db_connect()
@@ -171,79 +358,39 @@ def create_access_code():
         exists = cursor.fetchone()
 
         if not exists:
-
             cursor.execute(
                 "INSERT INTO access_codes (code) VALUES (?)",
                 (code,)
             )
-
             conn.commit()
             conn.close()
-
             return code
 
         conn.close()
 
 
 # =========================================================
-# المشتركين
-# =========================================================
-
-def get_subscribers():
-
-    conn = db_connect()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT user_id, activated_at
-        FROM users
-        ORDER BY activated_at DESC
-        """
-    )
-
-    users = cursor.fetchall()
-
-    conn.close()
-
-    return users
-
-
-def delete_subscriber(user_id):
-
-    conn = db_connect()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "DELETE FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    deleted = cursor.rowcount > 0
-
-    conn.commit()
-    conn.close()
-
-    return deleted
-
-
-# =========================================================
-# إحصائيات الإدارة
+# الإحصائيات
 # =========================================================
 
 def get_statistics():
-
     conn = db_connect()
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT COUNT(*) FROM users"
-    )
-    users_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
 
     cursor.execute(
-        "SELECT COUNT(*) FROM access_codes"
+        "SELECT COUNT(*) FROM users WHERE active = 1"
     )
+    active_users = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE active = 0"
+    )
+    suspended_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM access_codes")
     total_codes = cursor.fetchone()[0]
 
     cursor.execute(
@@ -251,51 +398,376 @@ def get_statistics():
     )
     used_codes = cursor.fetchone()[0]
 
-    unused_codes = total_codes - used_codes
+    cursor.execute("SELECT COUNT(*) FROM signal_history")
+    signals_count = cursor.fetchone()[0]
 
     conn.close()
 
     return (
-        users_count,
+        total_users,
+        active_users,
+        suspended_users,
         total_codes,
         used_codes,
-        unused_codes
+        total_codes - used_codes,
+        signals_count,
     )
 
 
 # =========================================================
-# Render Health Server
+# الإشارات / السجل
 # =========================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
+last_signal_time = {}
 
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
 
-    def log_message(self, format, *args):
+def save_signal(user_id, pair, direction, duration):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO signal_history
+        (user_id, pair, direction, duration, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, pair, direction, duration, utc_now())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_history(user_id, limit=10):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT pair, direction, duration, created_at
+        FROM signal_history
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit)
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return rows
+
+
+# =========================================================
+# المفضلة
+# =========================================================
+
+def get_favorites(user_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT pair
+        FROM favorites
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        """,
+        (user_id,)
+    )
+
+    rows = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    return rows
+
+
+def add_favorite(user_id, pair):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO favorites
+        (user_id, pair, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, pair, utc_now())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def remove_favorite(user_id, pair):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM favorites WHERE user_id = ? AND pair = ?",
+        (user_id, pair)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# إعدادات النظام
+# =========================================================
+
+def get_setting(key, default=""):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (key,)
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def maintenance_enabled():
+    return get_setting("maintenance", "0") == "1"
+
+
+# =========================================================
+# تنظيف الرسائل
+# =========================================================
+
+def track_message(user_id, chat_id, message_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO user_messages
+        (user_id, chat_id, message_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, chat_id, message_id, utc_now())
+    )
+
+    # نحافظ فقط على آخر MAX_TRACKED_MESSAGES
+    cursor.execute(
+        """
+        SELECT chat_id, message_id
+        FROM user_messages
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT -1 OFFSET ?
+        """,
+        (user_id, MAX_TRACKED_MESSAGES)
+    )
+
+    old = cursor.fetchall()
+
+    if old:
+        cursor.executemany(
+            """
+            DELETE FROM user_messages
+            WHERE user_id = ? AND chat_id = ? AND message_id = ?
+            """,
+            [
+                (user_id, chat_id, message_id)
+                for chat_id, message_id in old
+            ]
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def forget_message(user_id, chat_id, message_id):
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        DELETE FROM user_messages
+        WHERE user_id = ? AND chat_id = ? AND message_id = ?
+        """,
+        (user_id, chat_id, message_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+async def safe_delete_message(bot, user_id, chat_id, message_id):
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id
+        )
+    except Exception:
+        # Telegram قد يمنع حذف بعض الرسائل حسب عمر الرسالة
+        # أو صلاحيات Bot API. نتجاهل الخطأ حتى لا يتعطل البوت.
         pass
 
+    forget_message(user_id, chat_id, message_id)
 
-def start_health_server():
 
-    port = int(os.getenv("PORT", "10000"))
+async def cleanup_user_messages(
+    bot,
+    user_id,
+    chat_id,
+    keep_message_id=None
+):
+    conn = db_connect()
+    cursor = conn.cursor()
 
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
+    cursor.execute(
+        """
+        SELECT message_id
+        FROM user_messages
+        WHERE user_id = ? AND chat_id = ?
+        """,
+        (user_id, chat_id)
     )
 
-    server.serve_forever()
+    message_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    for message_id in message_ids:
+        if keep_message_id and message_id == keep_message_id:
+            continue
+
+        await safe_delete_message(
+            bot,
+            user_id,
+            chat_id,
+            message_id
+        )
 
 
 # =========================================================
-# قوائم العملاء
+# إرسال رسالة مع تسجيلها
+# =========================================================
+
+async def send_tracked(
+    bot,
+    user_id,
+    chat_id,
+    text,
+    reply_markup=None
+):
+    message = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup
+    )
+
+    track_message(
+        user_id,
+        chat_id,
+        message.message_id
+    )
+
+    return message
+
+
+async def edit_current(query, text, reply_markup=None):
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup
+        )
+
+        track_message(
+            query.from_user.id,
+            query.message.chat_id,
+            query.message.message_id
+        )
+
+    except Exception:
+        # إذا كانت الرسالة لا يمكن تعديلها، نرسل رسالة جديدة.
+        message = await query.message.reply_text(
+            text,
+            reply_markup=reply_markup
+        )
+
+        track_message(
+            query.from_user.id,
+            query.message.chat_id,
+            message.message_id
+        )
+
+
+# =========================================================
+# القوائم
 # =========================================================
 
 def main_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📈 الأسواق الحقيقية",
+                callback_data="real"
+            ),
+            InlineKeyboardButton(
+                "🟣 أسواق OTC",
+                callback_data="otc"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⭐ المفضلة",
+                callback_data="favorites"
+            ),
+            InlineKeyboardButton(
+                "📜 سجل الإشارات",
+                callback_data="history"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👤 حسابي",
+                callback_data="account"
+            ),
+            InlineKeyboardButton(
+                "📖 طريقة الاستخدام",
+                callback_data="guide"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎧 الدعم",
+                callback_data="support"
+            ),
+            InlineKeyboardButton(
+                "⚠️ المخاطر",
+                callback_data="warning"
+            )
+        ]
+    ]
 
+    return InlineKeyboardMarkup(keyboard)
+
+
+def markets_menu():
     keyboard = [
         [
             InlineKeyboardButton(
@@ -311,8 +783,14 @@ def main_menu():
         ],
         [
             InlineKeyboardButton(
-                "⚠️ تحذير المخاطر",
-                callback_data="warning"
+                "⭐ المفضلة",
+                callback_data="favorites"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 الرئيسية",
+                callback_data="home"
             )
         ]
     ]
@@ -321,11 +799,9 @@ def main_menu():
 
 
 def pair_menu(pairs, prefix):
-
     keyboard = []
 
     for i in range(0, len(pairs), 2):
-
         row = [
             InlineKeyboardButton(
                 pairs[i],
@@ -334,7 +810,6 @@ def pair_menu(pairs, prefix):
         ]
 
         if i + 1 < len(pairs):
-
             row.append(
                 InlineKeyboardButton(
                     pairs[i + 1],
@@ -346,20 +821,15 @@ def pair_menu(pairs, prefix):
 
     keyboard.append([
         InlineKeyboardButton(
-            "🔙 رجوع",
-            callback_data="markets"
+            "🏠 الرئيسية",
+            callback_data="home"
         )
     ])
 
     return InlineKeyboardMarkup(keyboard)
 
 
-# =========================================================
-# لوحة الإدارة
-# =========================================================
-
 def admin_menu():
-
     keyboard = [
         [
             InlineKeyboardButton(
@@ -369,20 +839,24 @@ def admin_menu():
         ],
         [
             InlineKeyboardButton(
-                "🚫 حذف مشترك",
-                callback_data="admin_delete"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🎟 إنشاء كود جديد",
+                "🎟 إنشاء كود",
                 callback_data="admin_newcode"
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
                 "📊 الإحصائيات",
                 callback_data="admin_stats"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 إرسال إعلان",
+                callback_data="admin_broadcast"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🛠️ وضع الصيانة",
+                callback_data="admin_maintenance"
             )
         ]
     ]
@@ -390,22 +864,18 @@ def admin_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-# =========================================================
-# قائمة المشتركين
-# =========================================================
-
-def subscribers_menu():
-
+def admin_users_menu():
     users = get_subscribers()
 
     keyboard = []
 
-    for user_id, activated_at in users:
+    for user_id, activated_at, active in users:
+        status = "🟢" if active else "🔴"
 
         keyboard.append([
             InlineKeyboardButton(
-                f"🚫 حذف {user_id}",
-                callback_data=f"confirm_delete:{user_id}"
+                f"{status} {user_id}",
+                callback_data=f"admin_user:{user_id}"
             )
         ])
 
@@ -419,44 +889,102 @@ def subscribers_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
+def admin_user_actions(user_id, active):
+    keyboard = []
+
+    if active:
+        keyboard.append([
+            InlineKeyboardButton(
+                "🚫 إيقاف العضو",
+                callback_data=f"admin_suspend:{user_id}"
+            )
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton(
+                "✅ إعادة تفعيل العضو",
+                callback_data=f"admin_activate:{user_id}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "🔙 المشتركين",
+            callback_data="admin_users"
+        )
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# النصوص
+# =========================================================
+
+def home_text(user):
+    name = user.first_name or "صديقي"
+
+    return (
+        f"🦁 <b>{BOT_NAME}</b>\n\n"
+        f"مرحباً {name} 👋\n"
+        "تم التحقق من حسابك بنجاح.\n\n"
+        "اختر القسم الذي تريد الدخول إليه من القائمة:"
+    )
+
+
+GUIDE_TEXT = (
+    "📖 <b>طريقة الاستخدام</b>\n\n"
+    "1️⃣ افتح منصة التداول التي تستخدمها.\n\n"
+    "2️⃣ اختر السوق والزوج الذي تريد التداول عليه.\n\n"
+    "3️⃣ اختر نفس الزوج داخل البوت.\n\n"
+    "4️⃣ انتظر تجهيز الإشارة.\n\n"
+    "5️⃣ اضبط مدة العملية في منصة التداول حسب المدة الظاهرة في الإشارة.\n\n"
+    "6️⃣ ابدأ العملية إذا قررت الدخول.\n\n"
+    "⚠️ التداول ينطوي على مخاطر مالية، والإشارات لا تضمن تحقيق الربح."
+)
+
+
+WARNING_TEXT = (
+    "⚠️ <b>تحذير المخاطر</b>\n\n"
+    "التداول ينطوي على مخاطر مالية عالية وقد يؤدي إلى خسارة رأس المال.\n\n"
+    "الإشارات الصادرة من هذا البوت عشوائية وليست توصية استثمارية "
+    "ولا تمثل ضماناً للربح.\n\n"
+    "استخدم إدارة رأس مال مناسبة ولا تتداول بأموال لا تستطيع تحمل خسارتها."
+)
+
+
 # =========================================================
 # /start
 # =========================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # الأدمن
+    if not update.message:
+        return
+
     if is_admin(user_id):
-
         await update.message.reply_text(
-            "👑 أهلاً بك يا مدير بوت الأسد.\n\n"
-            "اختر من لوحة الإدارة:",
-            reply_markup=admin_menu()
+            "👑 <b>لوحة إدارة بوت الأسد</b>\n\n"
+            "اختر العملية التي تريد تنفيذها:",
+            reply_markup=admin_menu(),
+            parse_mode="HTML"
         )
-
         return
 
-    # مشترك مفعل
     if is_activated(user_id):
-
         await update.message.reply_text(
-            "🦁 أهلاً بك مجدداً في بوت الأسد\n\n"
-            "اختر السوق الذي تريد الدخول إليه:",
-            reply_markup=main_menu()
+            home_text(update.effective_user),
+            reply_markup=main_menu(),
+            parse_mode="HTML"
         )
-
         return
 
-    # غير مفعل
     await update.message.reply_text(
-        "🦁 أهلاً بك في بوت الأسد\n\n"
-        "🔐 هذا البوت مخصص للمشتركين فقط.\n\n"
-        "أرسل كود التفعيل الخاص بك لتفعيل الحساب."
+        "🦁 <b>مرحباً بك في بوت الأسد</b>\n\n"
+        "🔐 هذا البوت مخصص للمستخدمين المفعّلين.\n\n"
+        "إذا كان لديك كود تفعيل، أرسله هنا.",
+        parse_mode="HTML"
     )
 
 
@@ -464,25 +992,22 @@ async def start(
 # /admin
 # =========================================================
 
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-
         await update.message.reply_text(
             "⛔ هذا الأمر مخصص للإدارة فقط."
         )
-
         return
 
+    context.user_data.pop("admin_action", None)
+
     await update.message.reply_text(
-        "👑 لوحة إدارة بوت الأسد\n\n"
+        "👑 <b>لوحة إدارة بوت الأسد</b>\n\n"
         "اختر العملية التي تريد تنفيذها:",
-        reply_markup=admin_menu()
+        reply_markup=admin_menu(),
+        parse_mode="HTML"
     )
 
 
@@ -490,65 +1015,113 @@ async def admin_command(
 # /newcode
 # =========================================================
 
-async def new_code(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def new_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-
         await update.message.reply_text(
             "⛔ هذا الأمر مخصص للإدارة فقط."
         )
-
         return
 
     code = create_access_code()
 
     await update.message.reply_text(
-        "🎟 تم إنشاء كود تفعيل جديد\n\n"
-        f"🔐 الكود:\n{code}\n\n"
-        "♻️ يمكن استخدامه مرة واحدة فقط."
+        "🎟 <b>تم إنشاء كود تفعيل جديد</b>\n\n"
+        f"🔐 <code>{code}</code>\n\n"
+        "♻️ يستخدم مرة واحدة فقط.\n"
+        "♾️ العضوية بعد التفعيل دائمة.",
+        parse_mode="HTML"
     )
 
 
 # =========================================================
-# إرسال الإشارة
+# الإشارة
 # =========================================================
 
 async def send_signal(query, pair):
-
     user_id = query.from_user.id
 
     if not is_admin(user_id) and not is_activated(user_id):
-
-        await query.message.reply_text(
-            "🔐 يجب تفعيل حسابك أولاً."
+        await query.answer(
+            "🔐 يجب تفعيل حسابك أولاً.",
+            show_alert=True
         )
+        return
 
+    if maintenance_enabled() and not is_admin(user_id):
+        await query.answer(
+            "🛠️ البوت في وضع الصيانة حالياً.",
+            show_alert=True
+        )
         return
 
     now = time.time()
 
     if user_id in last_signal_time:
-
         elapsed = now - last_signal_time[user_id]
 
         if elapsed < SIGNAL_COOLDOWN:
+            remaining = int(SIGNAL_COOLDOWN - elapsed)
 
-            remaining = int(
-                SIGNAL_COOLDOWN - elapsed
+            await query.answer(
+                f"⏳ انتظر {remaining} ثانية قبل طلب إشارة جديدة.",
+                show_alert=True
             )
-
-            await query.message.reply_text(
-                f"⏳ انتظر {remaining} ثانية قبل طلب إشارة ثانية."
-            )
-
             return
 
     last_signal_time[user_id] = now
+
+    # تجهيز بصري صادق: البوت يجهز الإشارة، ولا يدعي وجود تحليل حقيقي.
+    loading_messages = [
+        "📊 <b>جاري تجهيز الإشارة...</b>\n\n⏳ يرجى الانتظار...",
+        "🔄 <b>جاري معالجة الطلب...</b>\n\n⏳ يتم تجهيز الإشارة...",
+        "⏳ <b>جارٍ الانتهاء من تجهيز الإشارة...</b>\n\n📡 لحظات فقط..."
+    ]
+
+    try:
+        await query.edit_message_text(
+            loading_messages[0],
+            parse_mode="HTML"
+        )
+
+        delay = random.uniform(
+            MIN_SIGNAL_DELAY,
+            MAX_SIGNAL_DELAY
+        )
+
+        started = time.monotonic()
+
+        # نغير الرسالة أثناء الانتظار دون تكديس رسائل.
+        stages = [
+            (0.0, loading_messages[0]),
+            (0.35, loading_messages[1]),
+            (0.70, loading_messages[2]),
+        ]
+
+        for progress, message in stages:
+            target = delay * progress
+            elapsed = time.monotonic() - started
+            wait_for = target - elapsed
+
+            if wait_for > 0:
+                await __import__("asyncio").sleep(wait_for)
+
+            try:
+                await query.edit_message_text(
+                    message,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        remaining = delay - (time.monotonic() - started)
+
+        if remaining > 0:
+            await __import__("asyncio").sleep(remaining)
+
+    except Exception:
+        pass
 
     direction = random.choice([
         "🟢 BUY",
@@ -557,38 +1130,66 @@ async def send_signal(query, pair):
 
     duration = random.randint(1, 15)
 
+    save_signal(
+        user_id,
+        pair,
+        direction,
+        duration
+    )
+
+    direction_text = "BUY" if "BUY" in direction else "SELL"
+
     keyboard = [
         [
             InlineKeyboardButton(
-                "🔄 إشارة ثانية",
+                "🔄 إشارة جديدة",
                 callback_data="new_signal"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⭐ إضافة للمفضلة",
+                callback_data=f"fav_add:{pair}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 الرئيسية",
+                callback_data="home"
             )
         ]
     ]
 
-    await query.message.reply_text(
-
-        "🦁 إشارة الأسد\n\n"
-        f"💱 السوق: {pair}\n"
-        f"📈 الاتجاه: {direction}\n"
-        f"⏱ المدة: {duration} دقيقة\n\n"
-        "⚡ يجب عليك الدخول إلى الإشارة فوراً\n\n"
-        "⚠️ التداول ينطوي على مخاطر مالية عالية.\n"
-        "هذه إشارة عشوائية وليست توصية استثمارية.",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    signal_text = (
+        "🦁 <b>إشارة الأسد</b>\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💱 <b>السوق:</b> {pair}\n"
+        f"📈 <b>الاتجاه:</b> {direction}\n"
+        f"⏱ <b>المدة:</b> {duration} دقيقة\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "⚠️ الإشارة عشوائية وليست توصية استثمارية.\n"
+        "التداول ينطوي على مخاطر مالية."
     )
 
+    try:
+        await query.edit_message_text(
+            signal_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    except Exception:
+        await query.message.reply_text(
+            signal_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+
 
 # =========================================================
-# استقبال رسائل النص
+# استقبال النصوص
 # =========================================================
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
@@ -601,49 +1202,75 @@ async def text_handler(
 
     if is_admin(user_id):
 
-        # إذا أرسل الأدمن رقم ID
-        if text.isdigit():
+        # إعلان جماعي
+        if context.user_data.get("admin_action") == "broadcast":
+            context.user_data.pop("admin_action", None)
 
-            subscriber_id = int(text)
+            users = get_active_users()
+            sent = 0
+            failed = 0
 
-            if not is_activated(subscriber_id):
-
-                await update.message.reply_text(
-                    "❌ هذا الـTelegram ID غير موجود ضمن المشتركين المفعّلين.",
-                    reply_markup=admin_menu()
-                )
-
-                return
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✅ نعم، احذف",
-                        callback_data=f"delete_user:{subscriber_id}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ إلغاء",
-                        callback_data="admin_back"
+            for subscriber_id in users:
+                try:
+                    await update.get_bot().send_message(
+                        chat_id=subscriber_id,
+                        text=(
+                            "📢 <b>إعلان من إدارة بوت الأسد</b>\n\n"
+                            + text
+                        ),
+                        parse_mode="HTML"
                     )
-                ]
-            ]
+                    sent += 1
+                except Exception:
+                    failed += 1
 
             await update.message.reply_text(
-                "⚠️ تأكيد الحذف\n\n"
-                f"🆔 Telegram ID: {subscriber_id}\n\n"
-                "هل أنت متأكد من حذف هذا المشترك؟",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                "📢 <b>تم إرسال الإعلان</b>\n\n"
+                f"✅ تم الإرسال: {sent}\n"
+                f"❌ تعذر الإرسال: {failed}",
+                reply_markup=admin_menu(),
+                parse_mode="HTML"
             )
-
             return
 
-        # الأدمن لا يحتاج يرسل أكواد
+        # إذا أرسل الأدمن Telegram ID
+        if text.isdigit():
+            subscriber_id = int(text)
+
+            if not user_exists(subscriber_id):
+                await update.message.reply_text(
+                    "❌ هذا الـTelegram ID غير موجود في قاعدة البيانات.",
+                    reply_markup=admin_menu()
+                )
+                return
+
+            conn = db_connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT active FROM users WHERE user_id = ?",
+                (subscriber_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            active = bool(row and row[0] == 1)
+
+            await update.message.reply_text(
+                f"👤 <b>بيانات العضو</b>\n\n"
+                f"🆔 {subscriber_id}\n"
+                f"📌 الحالة: {'🟢 فعال' if active else '🔴 موقوف'}",
+                reply_markup=admin_user_actions(
+                    subscriber_id,
+                    active
+                ),
+                parse_mode="HTML"
+            )
+            return
+
         await update.message.reply_text(
-            "👑 أنت داخل حساب الإدارة.\n\n"
-            "استخدم أزرار لوحة الإدارة.",
+            "👑 استخدم أزرار لوحة الإدارة.",
             reply_markup=admin_menu()
         )
-
         return
 
     # =====================================================
@@ -651,13 +1278,11 @@ async def text_handler(
     # =====================================================
 
     if is_activated(user_id):
-
         await update.message.reply_text(
             "🦁 حسابك مفعّل بالفعل.\n\n"
             "استخدم الأزرار الموجودة في البوت.",
             reply_markup=main_menu()
         )
-
         return
 
     # =====================================================
@@ -667,29 +1292,46 @@ async def text_handler(
     code = text.upper()
 
     if not code.startswith("LION-"):
-
         await update.message.reply_text(
             "🔐 أرسل كود التفعيل بالشكل الصحيح."
         )
-
         return
 
-    success = activate_code(code, user_id)
+    result = activate_code(code, user_id)
 
-    if not success:
-
+    if result == "success":
         await update.message.reply_text(
-            "❌ كود التفعيل غير صحيح أو تم استخدامه مسبقاً.\n\n"
-            "تأكد من الكود وحاول مرة أخرى."
+            "✅ <b>تم تفعيل حسابك بنجاح</b>\n\n"
+            "♾️ عضويتك دائمة.\n\n"
+            "🦁 أهلاً بك في بوت الأسد.",
+            reply_markup=main_menu(),
+            parse_mode="HTML"
         )
+        return
 
+    if result == "already_active":
+        await update.message.reply_text(
+            "🟢 حسابك مفعّل بالفعل.",
+            reply_markup=main_menu()
+        )
+        return
+
+    if result == "suspended":
+        await update.message.reply_text(
+            "🚫 حسابك موقوف حاليًا.\n\n"
+            "تواصل مع الدعم إذا كنت تعتقد أن هذا بالخطأ."
+        )
+        return
+
+    if result == "used":
+        await update.message.reply_text(
+            "❌ هذا الكود تم استخدامه مسبقًا."
+        )
         return
 
     await update.message.reply_text(
-        "✅ تم تفعيل حسابك بنجاح.\n\n"
-        "🦁 أهلاً بك في بوت الأسد\n"
-        "اختر السوق الذي تريد الدخول إليه:",
-        reply_markup=main_menu()
+        "❌ كود التفعيل غير صحيح.\n\n"
+        "تأكد من الكود وحاول مرة أخرى."
     )
 
 
@@ -697,11 +1339,7 @@ async def text_handler(
 # الأزرار
 # =========================================================
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
     await query.answer()
@@ -710,282 +1348,701 @@ async def button_handler(
     data = query.data
 
     # =====================================================
-    # حماية لوحة الإدارة
+    # حماية الإدارة
     # =====================================================
 
-    if data.startswith("admin_") or data.startswith("confirm_delete:") or data.startswith("delete_user:"):
+    admin_callbacks = (
+        "admin_",
+        "admin:",
+    )
 
+    if data.startswith(admin_callbacks):
         if not is_admin(user_id):
-
-            await query.message.reply_text(
-                "⛔ هذا القسم مخصص للإدارة فقط."
+            await query.answer(
+                "⛔ غير مصرح لك.",
+                show_alert=True
             )
-
             return
 
     # =====================================================
-    # الرجوع إلى لوحة الإدارة
+    # الأدمن: الرجوع
     # =====================================================
 
     if data == "admin_back":
+        context.user_data.pop("admin_action", None)
 
-        await query.message.reply_text(
-            "👑 لوحة إدارة بوت الأسد\n\n"
+        await edit_current(
+            query,
+            "👑 <b>لوحة إدارة بوت الأسد</b>\n\n"
             "اختر العملية التي تريد تنفيذها:",
-            reply_markup=admin_menu()
+            admin_menu()
         )
-
         return
 
     # =====================================================
-    # قائمة المشتركين
+    # الأدمن: المشتركين
     # =====================================================
 
     if data == "admin_users":
-
         users = get_subscribers()
 
         if not users:
-
-            await query.message.reply_text(
-                "👥 قائمة المشتركين\n\n"
-                "لا يوجد مشتركون مفعّلون حالياً.",
-                reply_markup=admin_menu()
+            await edit_current(
+                query,
+                "👥 <b>المشتركون</b>\n\nلا يوجد مشتركون.",
+                admin_menu()
             )
-
             return
 
-        text = "👥 قائمة المشتركين\n\n"
+        text = (
+            "👥 <b>المشتركون</b>\n\n"
+            f"إجمالي السجلات: {len(users)}\n\n"
+            "🟢 فعال | 🔴 موقوف"
+        )
 
-        for number, (subscriber_id, activated_at) in enumerate(
-            users,
-            start=1
-        ):
-
-            text += (
-                f"{number}️⃣ Telegram ID: {subscriber_id}\n"
-                f"📅 التفعيل: {activated_at}\n\n"
-            )
-
-        text += f"👤 إجمالي المشتركين: {len(users)}"
-
-        await query.message.reply_text(
+        await edit_current(
+            query,
             text,
-            reply_markup=subscribers_menu()
+            admin_users_menu()
         )
-
         return
 
     # =====================================================
-    # حذف مشترك يدويًا
+    # الأدمن: تفاصيل مستخدم
     # =====================================================
 
-    if data == "admin_delete":
+    if data.startswith("admin_user:"):
+        subscriber_id = int(data.split(":")[1])
 
-        await query.message.reply_text(
-            "🚫 حذف مشترك\n\n"
-            "أرسل Telegram ID الخاص بالمشترك الذي تريد حذفه.\n\n"
-            "مثال:\n"
-            "123456789"
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT activated_at, active
+            FROM users
+            WHERE user_id = ?
+            """,
+            (subscriber_id,)
         )
 
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            await query.answer(
+                "المستخدم غير موجود.",
+                show_alert=True
+            )
+            return
+
+        activated_at, active = row
+
+        await edit_current(
+            query,
+            "👤 <b>بيانات العضو</b>\n\n"
+            f"🆔 Telegram ID: <code>{subscriber_id}</code>\n"
+            f"📅 التفعيل: {activated_at}\n"
+            f"📌 الحالة: {'🟢 فعال' if active else '🔴 موقوف'}\n\n"
+            "♾️ العضوية دائمة.",
+            admin_user_actions(
+                subscriber_id,
+                bool(active)
+            )
+        )
         return
 
     # =====================================================
-    # إنشاء كود
+    # الأدمن: إيقاف مستخدم
+    # =====================================================
+
+    if data.startswith("admin_suspend:"):
+        subscriber_id = int(data.split(":")[1])
+
+        deactivate_user(subscriber_id)
+
+        await edit_current(
+            query,
+            "🚫 <b>تم إيقاف العضو</b>\n\n"
+            f"🆔 {subscriber_id}\n\n"
+            "لم يتم حذف سجله، ويمكن إعادته لاحقًا بدون كود جديد.",
+            admin_user_actions(
+                subscriber_id,
+                False
+            )
+        )
+        return
+
+    # =====================================================
+    # الأدمن: إعادة تفعيل
+    # =====================================================
+
+    if data.startswith("admin_activate:"):
+        subscriber_id = int(data.split(":")[1])
+
+        activate_existing_user(subscriber_id)
+
+        await edit_current(
+            query,
+            "✅ <b>تمت إعادة تفعيل العضو</b>\n\n"
+            f"🆔 {subscriber_id}\n\n"
+            "لا يحتاج إلى كود جديد.",
+            admin_user_actions(
+                subscriber_id,
+                True
+            )
+        )
+        return
+
+    # =====================================================
+    # الأدمن: إنشاء كود
     # =====================================================
 
     if data == "admin_newcode":
-
         code = create_access_code()
 
-        await query.message.reply_text(
-            "🎟 تم إنشاء كود جديد\n\n"
-            f"🔐 {code}\n\n"
-            "♻️ صالح للاستخدام مرة واحدة فقط."
+        await edit_current(
+            query,
+            "🎟 <b>تم إنشاء كود جديد</b>\n\n"
+            f"🔐 <code>{code}</code>\n\n"
+            "♻️ يستخدم مرة واحدة فقط.\n"
+            "♾️ العضوية بعد التفعيل دائمة.",
+            admin_menu()
         )
-
         return
 
     # =====================================================
-    # الإحصائيات
+    # الأدمن: إحصائيات
     # =====================================================
 
     if data == "admin_stats":
+        (
+            total_users,
+            active_users,
+            suspended_users,
+            total_codes,
+            used_codes,
+            unused_codes,
+            signals_count,
+        ) = get_statistics()
 
-        users_count, total, used, unused = get_statistics()
-
-        await query.message.reply_text(
-            "📊 إحصائيات بوت الأسد\n\n"
-            f"👥 المشتركين: {users_count}\n"
-            f"🎟 إجمالي الأكواد: {total}\n"
-            f"✅ الأكواد المستخدمة: {used}\n"
-            f"🟢 الأكواد المتبقية: {unused}"
+        await edit_current(
+            query,
+            "📊 <b>إحصائيات بوت الأسد</b>\n\n"
+            f"👥 إجمالي الأعضاء: {total_users}\n"
+            f"🟢 النشطون: {active_users}\n"
+            f"🔴 الموقوفون: {suspended_users}\n\n"
+            f"🎟 إجمالي الأكواد: {total_codes}\n"
+            f"✅ المستخدمة: {used_codes}\n"
+            f"🟢 المتبقية: {unused_codes}\n\n"
+            f"📡 إجمالي الإشارات المسجلة: {signals_count}",
+            admin_menu()
         )
-
         return
 
     # =====================================================
-    # تأكيد الحذف
+    # الأدمن: إعلان
     # =====================================================
 
-    if data.startswith("confirm_delete:"):
+    if data == "admin_broadcast":
+        context.user_data["admin_action"] = "broadcast"
 
-        subscriber_id = int(
-            data.split(":")[1]
+        await edit_current(
+            query,
+            "📢 <b>إرسال إعلان</b>\n\n"
+            "أرسل الآن نص الإعلان، وسيتم إرساله للمشتركين النشطين.\n\n"
+            "❌ لإلغاء العملية استخدم /admin",
+            admin_menu()
         )
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "✅ نعم، احذف",
-                    callback_data=f"delete_user:{subscriber_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ إلغاء",
-                    callback_data="admin_users"
-                )
-            ]
-        ]
-
-        await query.message.reply_text(
-            "⚠️ تأكيد الحذف\n\n"
-            f"🆔 Telegram ID:\n{subscriber_id}\n\n"
-            "هل تريد حذف هذا المشترك؟\n\n"
-            "سيتم إلغاء تفعيله ولن يستطيع استخدام البوت كمشترك.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
         return
 
     # =====================================================
-    # تنفيذ الحذف
+    # الأدمن: صيانة
     # =====================================================
 
-    if data.startswith("delete_user:"):
+    if data == "admin_maintenance":
+        current = maintenance_enabled()
+        new_value = "0" if current else "1"
 
-        subscriber_id = int(
-            data.split(":")[1]
+        set_setting("maintenance", new_value)
+
+        status = "🛠️ مفعّل" if new_value == "1" else "🟢 متوقف"
+
+        await edit_current(
+            query,
+            "🛠️ <b>وضع الصيانة</b>\n\n"
+            f"الحالة الحالية: {status}\n\n"
+            "الأدمن يستطيع استخدام البوت أثناء الصيانة.",
+            admin_menu()
         )
-
-        deleted = delete_subscriber(subscriber_id)
-
-        if deleted:
-
-            await query.message.reply_text(
-                "✅ تم حذف المشترك بنجاح.\n\n"
-                f"🆔 Telegram ID: {subscriber_id}",
-                reply_markup=admin_menu()
-            )
-
-        else:
-
-            await query.message.reply_text(
-                "❌ لم يتم العثور على هذا المشترك.",
-                reply_markup=admin_menu()
-            )
-
         return
 
     # =====================================================
-    # منع العميل غير المفعل
+    # منع غير المفعل
     # =====================================================
 
     if not is_admin(user_id) and not is_activated(user_id):
-
-        await query.message.reply_text(
-            "🔐 حسابك غير مفعّل.\n"
-            "أرسل كود التفعيل أولاً."
+        await query.answer(
+            "🔐 فعّل حسابك أولاً.",
+            show_alert=True
         )
-
         return
 
     # =====================================================
-    # قوائم العميل
+    # الصيانة
+    # =====================================================
+
+    if maintenance_enabled() and not is_admin(user_id):
+        allowed = {
+            "home",
+            "account",
+            "guide",
+            "support",
+            "warning",
+        }
+
+        if data not in allowed:
+            await query.answer(
+                "🛠️ البوت في وضع الصيانة حاليًا.",
+                show_alert=True
+            )
+            return
+
+    # =====================================================
+    # الرئيسية
+    # =====================================================
+
+    if data == "home":
+        await edit_current(
+            query,
+            home_text(query.from_user),
+            main_menu()
+        )
+        return
+
+    # =====================================================
+    # الأسواق
     # =====================================================
 
     if data == "markets":
-
-        await query.message.reply_text(
-            "🦁 اختر السوق:",
-            reply_markup=main_menu()
+        await edit_current(
+            query,
+            "📊 <b>الأسواق</b>\n\nاختر القسم:",
+            markets_menu()
         )
+        return
 
-    elif data == "new_signal":
-
-        await query.message.reply_text(
-            "🦁 اختر السوق:",
-            reply_markup=main_menu()
+    if data == "real":
+        await edit_current(
+            query,
+            "📈 <b>الأسواق الحقيقية</b>\n\nاختر زوج العملات:",
+            pair_menu(REAL_PAIRS, "realpair")
         )
+        return
 
-    elif data == "real":
-
-        await query.message.reply_text(
-            "📈 اختر زوج العملات:",
-            reply_markup=pair_menu(
-                REAL_PAIRS,
-                "realpair"
-            )
+    if data == "otc":
+        await edit_current(
+            query,
+            "🟣 <b>أسواق OTC</b>\n\nاختر الزوج:",
+            pair_menu(OTC_PAIRS, "otcpair")
         )
+        return
 
-    elif data == "otc":
+    # =====================================================
+    # الزوج الحقيقي
+    # =====================================================
 
-        await query.message.reply_text(
-            "🟣 اختر زوج OTC:",
-            reply_markup=pair_menu(
-                OTC_PAIRS,
-                "otcpair"
-            )
-        )
-
-    elif data.startswith("realpair:"):
-
-        index = int(
-            data.split(":")[1]
-        )
+    if data.startswith("realpair:"):
+        index = int(data.split(":")[1])
 
         if index < 0 or index >= len(REAL_PAIRS):
+            await query.answer(
+                "زوج غير صالح.",
+                show_alert=True
+            )
             return
 
         await send_signal(
             query,
             REAL_PAIRS[index]
         )
+        return
 
-    elif data.startswith("otcpair:"):
+    # =====================================================
+    # زوج OTC
+    # =====================================================
 
-        index = int(
-            data.split(":")[1]
-        )
+    if data.startswith("otcpair:"):
+        index = int(data.split(":")[1])
 
         if index < 0 or index >= len(OTC_PAIRS):
+            await query.answer(
+                "زوج غير صالح.",
+                show_alert=True
+            )
             return
 
         await send_signal(
             query,
             OTC_PAIRS[index]
         )
+        return
 
-    elif data == "warning":
+    # =====================================================
+    # إشارة جديدة
+    # =====================================================
 
-        await query.message.reply_text(
-
-            "⚠️ تحذير المخاطر\n\n"
-
-            "التداول ينطوي على مخاطر مالية عالية.\n"
-            "الإشارات الموجودة في هذا البوت عشوائية وليست توصية استثمارية.\n"
-            "استخدم رأس مال تستطيع تحمل خسارته."
+    if data == "new_signal":
+        await edit_current(
+            query,
+            "📊 <b>اختر السوق لإشارة جديدة</b>",
+            markets_menu()
         )
+        return
+
+    # =====================================================
+    # الحساب
+    # =====================================================
+
+    if data == "account":
+        conn = db_connect()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT activated_at, active
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        )
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            await query.answer(
+                "الحساب غير موجود.",
+                show_alert=True
+            )
+            return
+
+        activated_at, active = row
+
+        await edit_current(
+            query,
+            "👤 <b>حسابي</b>\n\n"
+            f"📌 الحالة: {'🟢 فعالة' if active else '🔴 موقوفة'}\n"
+            "♾️ العضوية: دائمة\n"
+            f"📅 تاريخ التفعيل: {activated_at}\n"
+            f"🆔 Telegram ID: <code>{user_id}</code>",
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # طريقة الاستخدام
+    # =====================================================
+
+    if data == "guide":
+        await edit_current(
+            query,
+            GUIDE_TEXT,
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # المخاطر
+    # =====================================================
+
+    if data == "warning":
+        await edit_current(
+            query,
+            WARNING_TEXT,
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # الدعم
+    # =====================================================
+
+    if data == "support":
+        support_url = f"tg://user?id={ADMIN_ID}"
+
+        await edit_current(
+            query,
+            "🎧 <b>مركز الدعم</b>\n\n"
+            "إذا واجهت مشكلة أو تحتاج إلى مساعدة، "
+            "اضغط على زر التواصل مع الدعم.",
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💬 التواصل مع الدعم",
+                        url=support_url
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # المفضلة
+    # =====================================================
+
+    if data == "favorites":
+        favorites = get_favorites(user_id)
+
+        if not favorites:
+            await edit_current(
+                query,
+                "⭐ <b>المفضلة</b>\n\n"
+                "لا توجد أزواج محفوظة حتى الآن.\n\n"
+                "بعد ظهور أي إشارة يمكنك إضافتها للمفضلة.",
+                InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "📊 الأسواق",
+                            callback_data="markets"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🏠 الرئيسية",
+                            callback_data="home"
+                        )
+                    ]
+                ])
+            )
+            return
+
+        keyboard = []
+
+        for pair in favorites:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"⭐ {pair}",
+                    callback_data=f"favorite_signal:{pair}"
+                ),
+                InlineKeyboardButton(
+                    "🗑",
+                    callback_data=f"fav_remove:{pair}"
+                )
+            ])
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "🏠 الرئيسية",
+                callback_data="home"
+            )
+        ])
+
+        await edit_current(
+            query,
+            "⭐ <b>المفضلة</b>\n\n"
+            "اختر زوجًا للحصول على إشارة:",
+            InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # =====================================================
+    # إضافة للمفضلة
+    # =====================================================
+
+    if data.startswith("fav_add:"):
+        pair = data.split(":", 1)[1]
+
+        add_favorite(user_id, pair)
+
+        await query.answer(
+            "⭐ تمت إضافة الزوج للمفضلة.",
+            show_alert=True
+        )
+
+        return
+
+    # =====================================================
+    # حذف من المفضلة
+    # =====================================================
+
+    if data.startswith("fav_remove:"):
+        pair = data.split(":", 1)[1]
+
+        remove_favorite(user_id, pair)
+
+        await query.answer(
+            "🗑 تمت إزالة الزوج من المفضلة.",
+            show_alert=True
+        )
+
+        # إعادة فتح القائمة
+        favorites = get_favorites(user_id)
+
+        if not favorites:
+            await edit_current(
+                query,
+                "⭐ <b>المفضلة</b>\n\n"
+                "لا توجد أزواج محفوظة.",
+                InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🏠 الرئيسية",
+                            callback_data="home"
+                        )
+                    ]
+                ])
+            )
+            return
+
+        keyboard = []
+
+        for favorite in favorites:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"⭐ {favorite}",
+                    callback_data=f"favorite_signal:{favorite}"
+                ),
+                InlineKeyboardButton(
+                    "🗑",
+                    callback_data=f"fav_remove:{favorite}"
+                )
+            ])
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "🏠 الرئيسية",
+                callback_data="home"
+            )
+        ])
+
+        await edit_current(
+            query,
+            "⭐ <b>المفضلة</b>\n\n"
+            "اختر زوجًا للحصول على إشارة:",
+            InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # =====================================================
+    # إشارة من المفضلة
+    # =====================================================
+
+    if data.startswith("favorite_signal:"):
+        pair = data.split(":", 1)[1]
+
+        await send_signal(
+            query,
+            pair
+        )
+        return
+
+    # =====================================================
+    # سجل الإشارات
+    # =====================================================
+
+    if data == "history":
+        rows = get_history(user_id)
+
+        if not rows:
+            await edit_current(
+                query,
+                "📜 <b>سجل الإشارات</b>\n\n"
+                "لا توجد إشارات مسجلة حتى الآن.",
+                InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🏠 الرئيسية",
+                            callback_data="home"
+                        )
+                    ]
+                ])
+            )
+            return
+
+        lines = ["📜 <b>آخر الإشارات</b>\n"]
+
+        for pair, direction, duration, created_at in rows:
+            short_date = created_at[:19].replace("T", " ")
+            lines.append(
+                f"• {pair} — {direction} — {duration} د\n"
+                f"  🕐 {short_date}"
+            )
+
+        await edit_current(
+            query,
+            "\n".join(lines),
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🏠 الرئيسية",
+                        callback_data="home"
+                    )
+                ]
+            ])
+        )
+        return
 
 
 # =========================================================
-# تشغيل البوت
+# Health Server
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    server.serve_forever()
+
+
+# =========================================================
+# التشغيل
 # =========================================================
 
 def main():
-
     if not TOKEN:
-
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is not set"
         )
@@ -1004,33 +2061,18 @@ def main():
         .build()
     )
 
-    # /start
     app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
-    # /admin
     app.add_handler(
-        CommandHandler(
-            "admin",
-            admin_command
-        )
+        CommandHandler("admin", admin_command)
     )
 
-    # /newcode
     app.add_handler(
-        CommandHandler(
-            "newcode",
-            new_code
-        )
+        CommandHandler("newcode", new_code)
     )
 
-    # جميع الرسائل النصية
-    # الأدمن: رقم = حذف مشترك
-    # العميل: LION-XXXX = تفعيل
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1038,15 +2080,11 @@ def main():
         )
     )
 
-    # الأزرار
     app.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
+        CallbackQueryHandler(button_handler)
     )
 
     print("Bot started")
-
     app.run_polling()
 
 
